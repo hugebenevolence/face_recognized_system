@@ -1,0 +1,10 @@
+.env
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.venv/
+samples/*
+!samples/.gitkeep
+*.tsbuildinfo
+frontend/next-env.d.ts
