@@ -5,7 +5,7 @@ panel letters, pastel semantic colours with dark edges, trapezoid network blocks
 vectors drawn as coloured bars, hollow block arrows, dashed grouping boxes, bold coloured
 headings and small illustrations instead of text-only boxes. Technology logos mark the stack.
 
-a  Real-time recognition pipeline
+a  Real-time recognition pipeline (one DeepStream graph on the GPU)
 b  Services and deployment (Docker Compose)
 """
 
@@ -49,7 +49,7 @@ plt.rcParams.update(
     }
 )
 
-W, H = 16.0, 8.4
+W, H = 16.0, 9.5
 fig = plt.figure(figsize=(W, H))
 ax = fig.add_axes([0, 0, 1, 1])
 ax.set_xlim(0, W)
@@ -168,47 +168,48 @@ def stage_label(cx, y, title, sub, color):
 
 
 # ================================================================== panel a
-text(0.18, 8.15, "a", size=30, color=C["edge"], weight="bold", ha="left")
-text(0.75, 8.15, "Real-time recognition pipeline", size=18, color=C["blue"], weight="bold", ha="left")
+text(0.18, 9.25, "a", size=30, color=C["edge"], weight="bold", ha="left")
+text(0.75, 9.25, "Real-time recognition pipeline", size=18, color=C["blue"], weight="bold", ha="left")
 
-YS, BW, BH = 6.2, 1.55, 1.55
+YS, BW, BH = 7.3, 1.55, 1.55
 XS = [1.05 + 2.17 * i for i in range(7)]
 Y_LABEL = YS - BH / 2 - 0.3
 
-# dashed grouping box around the Python pipeline service (decode to match)
-rbox((XS[1] + XS[5]) / 2, YS - 0.15, XS[5] - XS[1] + BW + 0.45, BH + 2.05, C["blue_tint"], edge=C["blue"], lw=2.2, r=0.22, ls=(0, (5, 3)), z=1)
-text(XS[1] - BW / 2 - 0.05, YS + BH / 2 + 0.55, "Pipeline service", size=13, color=C["blue"], weight="bold", ha="left")
+# dashed grouping box around the DeepStream graph (decode to output)
+rbox((XS[1] + XS[6]) / 2, YS - 0.15, XS[6] - XS[1] + BW + 0.45, BH + 2.05, C["blue_tint"], edge=C["blue"], lw=2.2, r=0.22, ls=(0, (5, 3)), z=1)
+text(XS[1] - BW / 2 - 0.05, YS + BH / 2 + 0.55, "DeepStream pipeline service (GPU)", size=13, color=C["blue"], weight="bold", ha="left")
+logo("nvidia", XS[6] + BW / 2 - 0.15, YS + BH / 2 + 0.58, 0.42, z=7)
 
 # 1 source
 rbox(XS[0], YS, BW, BH, C["gray_fill"])
 camera_icon(XS[0], YS + 0.05, 1.25)
-stage_label(XS[0], Y_LABEL, "Source", "RTSP webcam or file", C["gray"])
+stage_label(XS[0], Y_LABEL, "Source", "RTSP, file, browser", C["gray"])
 
 # 2 decode
 rbox(XS[1], YS, BW, BH, C["blue_fill"])
 logo("gstreamer", XS[1], YS, 1.0)
-stage_label(XS[1], Y_LABEL, "Decode", "GStreamer", C["blue"])
+stage_label(XS[1], Y_LABEL, "Decode", "NVDEC and batching", C["blue"])
 
 # 3 detect
 rbox(XS[2], YS, BW, BH, C["blue_fill"])
 face(XS[2], YS, 1.35)
-stage_label(XS[2], Y_LABEL, "Detect", "SCRFD landmarks", C["blue"])
-logo("onnx", XS[2] - BW / 2 + 0.24, YS - BH / 2 + 0.24, 0.32, z=7)
+stage_label(XS[2], Y_LABEL, "Detect", "SCRFD on TensorRT", C["blue"])
+logo("nvidia", XS[2] - BW / 2 + 0.24, YS - BH / 2 + 0.24, 0.32, z=7)
 
 # 4 track
 rbox(XS[3], YS, BW, BH, C["blue_fill"])
 for dx, dy, lab, col in [(-0.33, 0.12, "#1", "#2EB84B"), (0.33, -0.12, "#2", C["blue2"])]:
     ax.add_patch(Rectangle((XS[3] + dx - 0.3, YS + dy - 0.38), 0.6, 0.76, facecolor="#F6F9FC", edgecolor=col, linewidth=2.4, zorder=5))
     chip(XS[3] + dx - 0.04, YS + dy + 0.38, lab, col, w=0.42, h=0.24, size=10.5)
-stage_label(XS[3], Y_LABEL, "Track", "IoU tracker", C["blue"])
+stage_label(XS[3], Y_LABEL, "Track", "nvtracker ids", C["blue"])
 
 # 5 embed
 rbox(XS[4], YS, BW, BH, C["blue_fill"])
 trapezoid(XS[4] - 0.22, YS, 0.85, 1.05, 0.55, "#9CC2E8")
 text(XS[4] - 0.24, YS, "F", size=24, color=C["blue"], weight="bold", style="italic")
 embedding_bar(XS[4] + 0.52, YS, 0.2, 1.0)
-stage_label(XS[4], Y_LABEL, "Embed", "ArcFace 512-d", C["blue"])
-logo("onnx", XS[4] - BW / 2 + 0.24, YS - BH / 2 + 0.24, 0.32, z=7)
+stage_label(XS[4], Y_LABEL, "Embed", "ArcFace on TensorRT", C["blue"])
+logo("nvidia", XS[4] - BW / 2 + 0.24, YS - BH / 2 + 0.24, 0.32, z=7)
 
 # 6 match
 rbox(XS[5], YS, BW, BH, C["green_fill"], edge=C["edge"])
@@ -222,30 +223,30 @@ ax.add_patch(Rectangle((XS[6] - 0.62, YS - 0.5), 1.24, 1.0, facecolor="#4A525E",
 face(XS[6] - 0.05, YS + 0.07, 0.95, box=False, landmarks=False, z=5)
 ax.add_patch(Rectangle((XS[6] - 0.42, YS - 0.33), 0.74, 0.8, facecolor="none", edgecolor="#2EB84B", linewidth=2.4, zorder=7))
 chip(XS[6] - 0.02, YS - 0.43, "Alice 0.92", "#2EB84B", size=9.5, w=0.95, h=0.22)
-stage_label(XS[6], Y_LABEL, "Output", "video and events", C["edge"])
+stage_label(XS[6], Y_LABEL, "Output", "draw, encode, events", C["edge"])
 
 # block arrows with the data that flows through them
 labels = ["frames", "faces", "tracks", "vectors", "matches", "result"]
 for i, lab in enumerate(labels):
-    if i in (0, 5):  # the two outer labels would sit on the dashed group border
+    if i == 0:  # this label would sit on the dashed group border
         lab = ""
     x0, x1 = XS[i] + BW / 2 + 0.05, XS[i + 1] - BW / 2 - 0.05
     fat_arrow(x0, x1, YS, color="#CAD6E2" if i not in (4, 5) else "#D6E9D2")
     text((x0 + x1) / 2, YS + BH / 2 + 0.2, lab, size=12, color=C["gray"], style="italic")
 
 # ================================================================== panel b
-text(0.18, 3.95, "b", size=30, color=C["edge"], weight="bold", ha="left")
-text(0.75, 3.95, "Services and deployment", size=18, color=C["blue"], weight="bold", ha="left")
+text(0.18, 5.05, "b", size=30, color=C["edge"], weight="bold", ha="left")
+text(0.75, 5.05, "Services and deployment", size=18, color=C["blue"], weight="bold", ha="left")
 
 # docker compose frame
-rbox(8.0, 1.75, 15.2, 3.0, "#F3F9FE", edge=C["docker"], lw=2.4, r=0.25, ls=(0, (6, 3)), z=1)
-logo("docker", 1.25, 3.0, 0.42, z=7)
-text(1.6, 3.0, "Docker Compose", size=14, color=C["docker"], weight="bold", ha="left")
+rbox(8.0, 2.28, 15.2, 4.46, "#F3F9FE", edge=C["docker"], lw=2.4, r=0.25, ls=(0, (6, 3)), z=1)
+logo("docker", 1.25, 4.15, 0.42, z=7)
+text(1.6, 4.15, "Docker Compose", size=14, color=C["docker"], weight="bold", ha="left")
 
-SY, SW, SH = 1.55, 2.7, 1.55
+SY, SW, SH = 2.85, 2.7, 1.55
 SX = [2.35, 6.1, 9.85, 13.6]
 specs = [
-    ("Pipeline", "SCRFD and ArcFace", C["blue_fill"], C["blue"], ["gstreamer", "onnx"]),
+    ("Pipeline", "DeepStream graph", C["blue_fill"], C["blue"], ["nvidia", "gstreamer"]),
     ("PostgreSQL", "pgvector", C["green_fill"], C["green"], ["postgresql"]),
     ("FastAPI", "REST and WebSocket", C["teal_fill"], C["teal"], ["fastapi"]),
     ("Next.js", "Live  Faces  History", C["violet_fill"], C["violet"], ["nextdotjs"]),
@@ -257,6 +258,15 @@ for (title, sub, fill, col, logos), cx in zip(specs, SX):
         logo(name, cx + (k - (n - 1) / 2) * 0.62, SY + 0.32, 0.55)
     text(cx, SY - 0.28, title, size=16, color=col, weight="bold")
     text(cx, SY - 0.58, sub, size=12.5, color=C["text"])
+
+# still-image service under the API
+EY, EW, EH = 0.95, 2.7, 1.1
+rbox(SX[2], EY, EW, EH, C["blue_fill"])
+logo("onnx", SX[2] - 0.55, EY + 0.12, 0.42)
+text(SX[2] + 0.35, EY + 0.12, "Enroll", size=16, color=C["blue"], weight="bold")
+text(SX[2], EY - 0.3, "registration, explanations", size=11.5, color=C["text"])
+line_arrow((SX[2], SY - SH / 2 - 0.04), (SX[2], EY + EH / 2 + 0.04), both=True)
+text(SX[2] + 0.72, (SY - SH / 2 + EY + EH / 2) / 2, "photos", size=11.5, color=C["gray"], style="italic")
 
 # data flows between services
 line_arrow((SX[0] + SW / 2 + 0.04, SY), (SX[1] - SW / 2 - 0.04, SY), both=True)

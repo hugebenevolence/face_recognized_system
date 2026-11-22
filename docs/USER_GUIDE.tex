@@ -110,20 +110,20 @@ continuously, while every decision is logged and can be explained afterwards. Th
 \newcolumntype{C}{>{\centering\arraybackslash}X}
 \noindent\begin{tabularx}{\linewidth}{CCCCCC}
   \includegraphics[height=0.62cm]{figures/tech/gstreamer.png} &
-  \includegraphics[height=0.62cm]{figures/tech/onnx.png} &
+  \includegraphics[height=0.62cm]{figures/tech/nvidia.png} &
   \includegraphics[height=0.62cm]{figures/tech/fastapi.png} &
   \includegraphics[height=0.62cm]{figures/tech/nextdotjs.png} &
   \includegraphics[height=0.62cm]{figures/tech/postgresql.png} &
   \includegraphics[height=0.62cm]{figures/tech/docker.png} \\[-1pt]
-  \footnotesize\textbf{GStreamer} & \footnotesize\textbf{ONNX} & \footnotesize\textbf{FastAPI} &
+  \footnotesize\textbf{GStreamer} & \footnotesize\textbf{DeepStream} & \footnotesize\textbf{FastAPI} &
   \footnotesize\textbf{Next.js} & \footnotesize\textbf{PostgreSQL} & \footnotesize\textbf{Docker}
 \end{tabularx}
 
 % ================================================================ II. Architecture
 \section{Architecture}
-Figure~1 summarizes the design. Frames travel from the source through detection, tracking, and
-embedding before they are matched against the stored faces. Meanwhile, the backend streams the
-annotated video and the events to the interface.
+Figure~1 summarizes the design. A single DeepStream graph runs on the GPU: frames travel from the source
+through detection, tracking, and embedding, all as pipeline elements, before they are matched against the stored
+faces. Meanwhile, the backend streams the annotated video and the events to the interface.
 \begin{figure}[!ht]
   \centering
   \includegraphics[width=0.96\linewidth]{figures/architecture.pdf}
@@ -133,16 +133,15 @@ annotated video and the events to the interface.
 % ================================================================ III. Quick Start
 \newpage
 \section{Quick Start}
-You need Docker with Compose v2 and a camera or an RTSP stream. An NVIDIA GPU is optional but faster.
-Clone the repository, then start the services with the command that matches your machine.
+You need Docker with Compose v2, an NVIDIA GPU (DeepStream runs on the GPU), and a camera or an RTSP stream.
+Clone the repository, then start the services.
 \begin{terminal}{Terminal}
 git clone https://github.com/hugebenevolence/face_recognized_system.git
 cd face_recognized_system
-docker compose up --build                                                  # CPU
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build  # GPU
+docker compose --profile sim up --build
 \end{terminal}
 Once the services are healthy, open \href{http://localhost:3000}{\texttt{http://localhost:3000}}.
-The first build takes a few minutes.
+The first start also builds the TensorRT engines, which takes a few minutes.
 
 % ================================================================ IV. Using the system
 \section{Using the System}

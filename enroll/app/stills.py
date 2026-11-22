@@ -8,7 +8,7 @@ import numpy as np
 
 from .face_engine import Detection, FaceEngine
 from .quality import assess
-from .tracker import iou
+from .geometry import iou
 
 # The detector rescales the image to fit its input square, so one size cannot suit both
 # extremes: small faces in a group photo need a big input (1280), but a close-up selfie

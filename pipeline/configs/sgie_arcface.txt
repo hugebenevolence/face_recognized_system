@@ -1,0 +1,23 @@
+# Secondary GIE: ArcFace (w600k_r50) embedding, one 512-d vector per tracked face.
+# The probe sets each face's ROI from its landmarks first, so nvinfer crops and scales
+# exactly the region ArcFace expects. The probe also marks faces whose identity is still
+# fresh so that this element skips them (class id 1).
+[property]
+gpu-id=0
+net-scale-factor=0.0078125
+offsets=127.5;127.5;127.5
+model-color-format=0
+onnx-file=/models/arcface_dyn.onnx
+model-engine-file=/models/arcface_dyn.onnx_b4_gpu0_fp16.engine
+batch-size=4
+network-mode=2
+gie-unique-id=2
+process-mode=2
+operate-on-gie-id=1
+operate-on-class-ids=0
+network-type=100
+output-tensor-meta=1
+classifier-async-mode=0
+input-object-min-width=32
+input-object-min-height=32
+maintain-aspect-ratio=0

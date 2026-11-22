@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from .face_engine import FaceEngine
-from .tracker import iou
+from .geometry import iou
 
 # Landmark layout of an aligned ArcFace crop (insightface's fixed 112x112 template):
 # left eye, right eye, nose tip, left mouth corner, right mouth corner.
