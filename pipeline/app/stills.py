@@ -6,15 +6,9 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .face_engine import Detection, FaceEngine
-from .quality import assess
+from .engine import Detection, FaceEngine
 from .geometry import iou
-
-# The detector rescales the image to fit its input square, so one size cannot suit both
-# extremes: small faces in a group photo need a big input (1280), but a close-up selfie
-# upscaled to 1280 makes the face so large it is missed (measured: a 230 px face is found at
-# 640 and lost at 1280). Stills are therefore detected at both scales and merged.
-SCALES = (640, 1280)
+from .quality import assess
 
 Box = tuple[float, float, float, float]
 
@@ -64,22 +58,9 @@ def _redetect_zoomed(engine: FaceEngine, img: np.ndarray, box: Box) -> Optional[
     return _select(mapped, box) if mapped else None
 
 
-def detect_multiscale(engine: FaceEngine, img: np.ndarray) -> list[Detection]:
-    """Faces found at every useful detector scale, duplicates merged (best score wins)."""
-    sizes = [
-        s for s in SCALES if s == SCALES[0] or max(img.shape[:2]) > 800
-    ]  # no point upscaling small images
-    found = [d for s in sizes for d in engine.detect(img, s)]
-    kept: list[Detection] = []
-    for d in sorted(found, key=lambda d: -d.score):
-        if all(iou(d.box, k.box) < 0.4 for k in kept):
-            kept.append(d)
-    return kept
-
-
 def find_faces(engine: FaceEngine, img: np.ndarray, box: Optional[Box] = None) -> list[Detection]:
     """All faces in the image, or just the one inside `box` (user selection)."""
-    dets = detect_multiscale(engine, img)
+    dets = engine.detect_multiscale(img)
     if box is None:
         return sorted(dets, key=lambda d: (d.box[1], d.box[0]))  # reading order, stable numbering
     sel = _select(dets, box) or _redetect_zoomed(engine, img, box)

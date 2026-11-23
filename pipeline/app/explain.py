@@ -16,15 +16,11 @@ import time
 import cv2
 import numpy as np
 
-from .face_engine import FaceEngine
-from .geometry import iou
+from .engine import FaceEngine
+from .geometry import TEMPLATE, iou
 
-# Landmark layout of an aligned ArcFace crop (insightface's fixed 112x112 template):
-# left eye, right eye, nose tip, left mouth corner, right mouth corner.
-ALIGNED_KPS = np.array(
-    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
-    dtype=np.float32,
-)
+# Landmark layout of an aligned ArcFace crop (the fixed 112x112 template).
+ALIGNED_KPS = TEMPLATE.astype(np.float32)
 REGION_ORDER = ["Eyes", "Nose", "Mouth", "Forehead", "Cheeks and jaw"]
 
 # Heavy: one at a time so an explanation never starves the live loop.

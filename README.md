@@ -10,8 +10,7 @@ Register faces in a web UI, watch a live video stream with recognised names draw
 |------------|-------------------------------------------------------------------------|------|
 | `db`       | `pgvector/pgvector:pg16`                                                | -    |
 | `backend`  | FastAPI, SQLAlchemy 2, pgvector                                         | 8000 |
-| `pipeline` | **NVIDIA DeepStream 7.1** (GStreamer, nvinfer / TensorRT, nvtracker), pyds | 8090 |
-| `enroll`   | insightface on ONNX Runtime, for still images (registration, explanations) | -    |
+| `pipeline` | **NVIDIA DeepStream 7.1** (GStreamer, nvinfer / TensorRT, nvtracker), pyds. Live video and still images | 8090 |
 | `frontend` | Next.js 14 (App Router)                                                 | 3000 |
 | `mediamtx` | optional simulated RTSP camera (`--profile sim`)                        | 8554 |
 
@@ -33,6 +32,18 @@ source ──► nvstreammux ──► nvinfer SCRFD ──► nvtracker ──�
 * Three small **pad probes** (`pipeline/app/analytics.py`) handle the metadata: decode SCRFD's raw tensors into boxes and landmarks, point the ArcFace region at the face (computed from the landmarks), then read the embedding, match it with pgvector and label the box. Matching and event delivery stay in Python because they talk to PostgreSQL and the backend.
 * Video reaches the browser as MJPEG through the backend (`/api/stream.mjpg`). Set `RTSP_OUT_URL` to also publish the annotated stream as H.264 over RTSP.
 
+### Registration uses the same pipeline
+
+Photos (registration, group photos, camera captures) and the explanation maps go through a second, small DeepStream graph that lives in the same container and shares the two models:
+
+```
+photo ──► view (640x640) ──► nvstreammux ──► nvinfer SCRFD ──► nvinfer ArcFace ──► embedding
+          tiles for big      batch of 1       finds faces        runs on the face    stored in pgvector
+          group photos                        (detect request)   region (embed request)
+```
+
+A face registered from a photo is therefore embedded by the same `nvinfer` elements and the same landmark crop as the same face on camera (`pipeline/app/still_graph.py`, `engine.py`). Large photos are cut into overlapping tiles so small faces keep their pixels. The occlusion maps pack many masked 112x112 faces into one view (a mosaic) and ArcFace embeds all of them in one pass.
+
 ## Quick start
 
 Requirements: Docker with Compose v2 and an **NVIDIA GPU** (DeepStream has no CPU mode) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) (on Windows: Docker Desktop with the WSL2 backend). Disk: the DeepStream base image is about 20 GB.
@@ -47,7 +58,7 @@ Easiest is a simulated RTSP camera: put any MP4 containing faces at `samples/dem
 docker compose --profile sim up --build
 ```
 
-The first start builds the TensorRT engines, which takes a few minutes (cached afterwards). Then open <http://localhost:3000>. Registration also runs on the GPU if you add `-f docker-compose.gpu.yml`.
+The first start builds the TensorRT engines, which takes a few minutes (cached afterwards). Registration waits for that to finish. Then open <http://localhost:3000>.
 
 ### 3. Try it
 
@@ -84,7 +95,7 @@ Set `SOURCE_URI` in `.env` (copy `.env.example`) for the default source at start
 - **Tracking**: `nvtracker` (IOU) gives each face a stable ID. The probe lets a face through to ArcFace every `ID_INTERVAL` frames (5) while it is unresolved and every `REID_INTERVAL` frames (45) once known. Each appearance produces **one** event (re-logged after `EVENT_COOLDOWN` seconds if the person stays in view, or immediately if their status changes).
 - **Events** are posted by the pipeline to the backend, which stores them in PostgreSQL (timestamp, person or Unknown, confidence, camera, snapshot path, evidence) and pushes them to browsers over `WS /ws/events`.
 - Snapshots and registered images are stored on the `appdata` volume and served at `/files/...`.
-- **Registration and live video use the same weights.** The `enroll` service embeds photos with ONNX Runtime and a full landmark alignment; the pipeline embeds live faces with TensorRT. For the same photo the two vectors agree to about 0.98 cosine similarity (measured), so they are directly comparable.
+- **Registration and live video use the same pipeline.** Photos are embedded by the still-image graph, live faces by the live graph. Both use the same ArcFace engine and the same landmark crop, so the vectors are directly comparable. As a check, 6 faces of a test video were found in one still frame and every stored registration photo re-embedded through the graph matched its stored vector with cosine similarity 0.88 to 0.99 (most above 0.97; the stored vectors came from an earlier ONNX Runtime version with full alignment).
 
 ## API
 
@@ -140,7 +151,7 @@ angles can only help recall; poor frames can hurt, which is why every shot is qu
   `similarity / threshold` on every face (drawn by `nvdsosd` from display metadata).
 * **Which regions matter** (on demand): *Explain regions* hides one patch at a time (occlusion
   sensitivity) and measures how far the score falls: for recognition (similarity to the matched person)
-  and for detection (detector confidence). It runs in the `enroll` service on the stored crops, never on the live stream, and is
+  and for detection (detector confidence). It runs in the still-image graph on the stored crops, never on the live stream, and is
   cached. It shows *model sensitivity*, not human-style reasons, and depends on patch size.
 
 ## Performance
@@ -167,9 +178,8 @@ All optional; see `.env.example`. Tuning knobs for the pipeline (`MATCH_THRESHOL
 ## Project layout
 
 ```
-backend/    FastAPI app (models, routers, WebSocket, clients for pipeline and enroll)
-pipeline/   DeepStream graph (runner.py), pad probes (analytics.py), SCRFD decoder, nvinfer/tracker configs
-enroll/     still-image face engine (registration, group photos, explanations)
+backend/    FastAPI app (models, routers, WebSocket, client for the pipeline service)
+pipeline/   DeepStream: live graph (runner.py, analytics.py), still-image graph (still_graph.py, engine.py, stills.py, explain.py), SCRFD decoder, nvinfer/tracker configs
 frontend/   Next.js UI (live, faces, history)
 samples/    put demo.mp4 here
 ```

@@ -121,12 +121,13 @@ continuously, while every decision is logged and can be explained afterwards. Th
 
 % ================================================================ II. Architecture
 \section{Architecture}
-Figure~1 summarizes the design. A single DeepStream graph runs on the GPU: frames travel from the source
-through detection, tracking, and embedding, all as pipeline elements, before they are matched against the stored
-faces. Meanwhile, the backend streams the annotated video and the events to the interface.
+Figure~1 summarizes the design. DeepStream graphs run on the GPU: live frames pass through detection, tracking,
+and embedding before they are matched against the stored faces. Registration photos use a second graph with
+the same models, so a registered face and a live face are embedded by the same code. The backend streams the
+annotated video and the events to the interface.
 \begin{figure}[!ht]
   \centering
-  \includegraphics[width=0.96\linewidth]{figures/architecture.pdf}
+  \includegraphics[width=0.92\linewidth]{figures/architecture.pdf}
   \caption{Recognition pipeline (a) and the services that deliver it (b).}
 \end{figure}
 

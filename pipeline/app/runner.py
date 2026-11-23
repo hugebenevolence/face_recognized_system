@@ -76,6 +76,7 @@ class Runner(threading.Thread):
         self._jpeg_seq = 0
         self._times: list[float] = []
         self.connected = False
+        self.engines_ready = threading.Event()
         self.last_error: Optional[str] = None
         self.browser_clients = 0
 
@@ -149,6 +150,7 @@ class Runner(threading.Thread):
         pipe = self._build(spec)
         bus = pipe.get_bus()
         pipe.set_state(Gst.State.PLAYING)
+        self.engines_ready.set()  # nvinfer has loaded (or built) the TensorRT engines by now
         started = time.monotonic()
         try:
             while not self._stop_evt.is_set() and self._gen == gen:

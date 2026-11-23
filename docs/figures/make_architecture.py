@@ -246,7 +246,7 @@ text(1.6, 4.15, "Docker Compose", size=14, color=C["docker"], weight="bold", ha=
 SY, SW, SH = 2.85, 2.7, 1.55
 SX = [2.35, 6.1, 9.85, 13.6]
 specs = [
-    ("Pipeline", "DeepStream graph", C["blue_fill"], C["blue"], ["nvidia", "gstreamer"]),
+    ("Pipeline", "live and still graphs", C["blue_fill"], C["blue"], ["nvidia", "gstreamer"]),
     ("PostgreSQL", "pgvector", C["green_fill"], C["green"], ["postgresql"]),
     ("FastAPI", "REST and WebSocket", C["teal_fill"], C["teal"], ["fastapi"]),
     ("Next.js", "Live  Faces  History", C["violet_fill"], C["violet"], ["nextdotjs"]),
@@ -259,14 +259,12 @@ for (title, sub, fill, col, logos), cx in zip(specs, SX):
     text(cx, SY - 0.28, title, size=16, color=col, weight="bold")
     text(cx, SY - 0.58, sub, size=12.5, color=C["text"])
 
-# still-image service under the API
-EY, EW, EH = 0.95, 2.7, 1.1
-rbox(SX[2], EY, EW, EH, C["blue_fill"])
-logo("onnx", SX[2] - 0.55, EY + 0.12, 0.42)
-text(SX[2] + 0.35, EY + 0.12, "Enroll", size=16, color=C["blue"], weight="bold")
-text(SX[2], EY - 0.3, "registration, explanations", size=11.5, color=C["text"])
-line_arrow((SX[2], SY - SH / 2 - 0.04), (SX[2], EY + EH / 2 + 0.04), both=True)
-text(SX[2] + 0.72, (SY - SH / 2 + EY + EH / 2) / 2, "photos", size=11.5, color=C["gray"], style="italic")
+# photos (registration, group photos, explanations) go back to the pipeline's still-image graph
+BOT = SY - SH / 2 - 0.04
+line_arrow((SX[2] - 0.5, BOT), (SX[0] + 0.5, BOT), both=True, rad=-0.22)
+text((SX[0] + SX[2]) / 2, BOT - 0.92, "photos and explanations", size=12, color=C["gray"], style="italic")
+text(SX[1] + 0.9, BOT - 1.4, "One GPU container runs both DeepStream graphs on the same two models",
+     size=12.5, color=C["blue"], style="italic")
 
 # data flows between services
 line_arrow((SX[0] + SW / 2 + 0.04, SY), (SX[1] - SW / 2 - 0.04, SY), both=True)

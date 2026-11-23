@@ -5,8 +5,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://face:face@db:5432/face"
-    pipeline_url: str = "http://pipeline:8090"  # DeepStream service: live video + status
-    enroll_url: str = "http://enroll:8090"  # still-image service: embeddings, group photos, explanations
+    pipeline_url: str = "http://pipeline:8090"  # DeepStream service: live video, still images, status
     internal_token: str = "change-me"
     data_dir: Path = Path("/data")
     cors_origins: str = "http://localhost:3000"

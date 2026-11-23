@@ -21,7 +21,9 @@ import numpy as np
 import pyds
 
 from .config import Config
+from .dsmeta import SKIP_CLASS, add_object, iter_list as _iter, read_embedding, read_tensors, set_rect
 from .events import EventPublisher
+from .geometry import aligned_crop, iou as _iou, roi_of
 from .matcher import Matcher
 from .quality import assess
 from .scrfd import Face, decode
@@ -31,54 +33,7 @@ _cudart = ctypes.CDLL("libcudart.so.12")
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
 ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
-PGIE_ID, SGIE_ID = 1, 2
-SKIP_CLASS = 1  # objects given this class are not sent to ArcFace and are dropped before drawing
-UNTRACKED_OBJECT_ID = 0xFFFFFFFFFFFFFFFF
-
-# ArcFace reference landmark positions inside the 112x112 face image.
-_TEMPLATE = np.array(
-    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
-    dtype=np.float64,
-)
-_TEMPLATE_MEAN = _TEMPLATE.mean(axis=0)
-_TEMPLATE_NORM = float(np.sqrt(((_TEMPLATE - _TEMPLATE_MEAN) ** 2).sum()))
-
 GREEN, RED, AMBER = (0.1, 0.75, 0.3), (0.9, 0.2, 0.2), (0.95, 0.65, 0.1)
-
-
-def _iter(head, cast):
-    while head is not None:
-        yield cast(head.data)
-        head = head.next
-
-
-def _iou(a, b) -> float:
-    ix1, iy1, ix2, iy2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return inter / union if union > 0 else 0.0
-
-
-def face_transform(kps: np.ndarray) -> tuple[float, np.ndarray]:
-    """Scale + translation that maps the five landmarks onto the ArcFace template.
-    Rotation is left out on purpose: nvinfer can only crop axis-aligned regions, and for
-    upright faces the result is within ~1% cosine of a full alignment (checked offline)."""
-    mean = kps.mean(axis=0)
-    spread = float(np.sqrt(((kps - mean) ** 2).sum())) or 1e-6
-    s = _TEMPLATE_NORM / spread
-    return s, _TEMPLATE_MEAN - s * mean
-
-
-def roi_of(kps: np.ndarray) -> tuple[float, float, float]:
-    """(left, top, side) of the frame region that becomes the 112x112 ArcFace input."""
-    s, t = face_transform(kps)
-    return float(-t[0] / s), float(-t[1] / s), 112.0 / s
-
-
-def aligned_crop(frame_bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
-    s, t = face_transform(kps)
-    m = np.array([[s, 0, t[0]], [0, s, t[1]]], dtype=np.float32)
-    return cv2.warpAffine(frame_bgr, m, (112, 112), flags=cv2.INTER_LINEAR)
 
 
 @dataclass
@@ -121,49 +76,19 @@ class Analytics:
         buf = info.get_buffer()
         bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
         for fm in _iter(bm.frame_meta_list, pyds.NvDsFrameMeta.cast):
-            tensors = self._read_tensors(fm)
-            faces = decode(tensors, self.cfg.frame_width, self.cfg.frame_height, self.cfg.det_thresh)
+            faces = decode(read_tensors(fm), self.cfg.frame_width, self.cfg.frame_height, self.cfg.det_thresh)
             faces = [f for f in faces if f.size >= self.cfg.min_face_px]
             self._faces[(fm.source_id, fm.frame_num)] = faces
             # nvinfer only sets this for the stock detector output types; nvtracker skips frames
             # without it, and ours is network-type=100 (raw tensors decoded here).
             fm.bInferDone = True
             for f in faces:
-                om = pyds.nvds_acquire_obj_meta_from_pool(bm)
-                om.unique_component_id = PGIE_ID
-                om.class_id = 0
-                om.confidence = f.score
-                om.object_id = UNTRACKED_OBJECT_ID
-                om.obj_label = "face"
-                self._set_rect(om, f.box)
-                om.detector_bbox_info.org_bbox_coords.left = f.box[0]
-                om.detector_bbox_info.org_bbox_coords.top = f.box[1]
-                om.detector_bbox_info.org_bbox_coords.width = f.box[2] - f.box[0]
-                om.detector_bbox_info.org_bbox_coords.height = f.box[3] - f.box[1]
-                pyds.nvds_add_obj_meta_to_frame(fm, om, None)
+                add_object(bm, fm, f.box, f.score)
         return Gst_PAD_PROBE_OK
 
     @staticmethod
-    def _read_tensors(fm) -> dict[tuple[int, int], np.ndarray]:
-        out: dict[tuple[int, int], np.ndarray] = {}
-        for um in _iter(fm.frame_user_meta_list, pyds.NvDsUserMeta.cast):
-            if um.base_meta.meta_type != pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
-                continue
-            tm = pyds.NvDsInferTensorMeta.cast(um.user_meta_data)
-            for i in range(tm.num_output_layers):
-                layer = pyds.get_nvds_LayerInfo(tm, i)
-                total = layer.inferDims.numElements
-                rows = layer.inferDims.d[0]
-                ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
-                arr = np.ctypeslib.as_array(ptr, shape=(total,)).reshape(rows, total // rows)
-                out[(rows, total // rows)] = arr
-        return out
-
-    @staticmethod
     def _set_rect(om, box) -> None:
-        r = om.rect_params
-        r.left, r.top = box[0], box[1]
-        r.width, r.height = box[2] - box[0], box[3] - box[1]
+        set_rect(om, box[0], box[1], box[2] - box[0], box[3] - box[1])
 
     # ------------------------------------------------------------------ probe 2: roi
     def on_roi(self, pad, info, _user=None):
@@ -237,7 +162,7 @@ class Analytics:
             st.last_seen = self.frame_idx
             st.face = face
 
-            emb = self._embedding(om)  # present only when on_roi let this face through to ArcFace
+            emb = read_embedding(om)  # present only when on_roi let this face through to ArcFace
             if emb is not None:
                 self._identify(st, emb)
             if st.status in ("known", "unknown") and st.hits >= cfg.min_hits:
@@ -265,20 +190,6 @@ class Analytics:
         if err != 0:
             raise RuntimeError(f"cudaMemcpy2D failed with code {err}")
         return out
-
-    @staticmethod
-    def _embedding(om) -> Optional[np.ndarray]:
-        for um in _iter(om.obj_user_meta_list, pyds.NvDsUserMeta.cast):
-            if um.base_meta.meta_type != pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
-                continue
-            tm = pyds.NvDsInferTensorMeta.cast(um.user_meta_data)
-            if tm.unique_id != SGIE_ID or tm.num_output_layers < 1:
-                continue
-            layer = pyds.get_nvds_LayerInfo(tm, 0)
-            ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
-            v = np.ctypeslib.as_array(ptr, shape=(layer.inferDims.numElements,)).astype(np.float32)
-            return v / (np.linalg.norm(v) + 1e-9)
-        return None
 
     # ------------------------------------------------------------------ decisions
     def _interval(self, st: TrackState) -> int:

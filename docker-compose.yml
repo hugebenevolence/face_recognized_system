@@ -1,7 +1,6 @@
-# Face Recognition stack. The live pipeline runs on DeepStream, so an NVIDIA GPU is required.
+# Face Recognition stack. Recognition runs on DeepStream, so an NVIDIA GPU is required.
 #   docker compose up --build
 #   + simulated RTSP camera from ./samples/demo.mp4 :  add  --profile sim
-#   + registration on the GPU as well :  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 name: face-recognition
 
 x-service-env: &service-env
@@ -34,7 +33,6 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-face}:${POSTGRES_PASSWORD:-face}@db:5432/${POSTGRES_DB:-face}
       PIPELINE_URL: http://pipeline:8090
-      ENROLL_URL: http://enroll:8090
       INTERNAL_TOKEN: ${INTERNAL_TOKEN:-change-me}
       DATA_DIR: /data
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
@@ -53,7 +51,8 @@ services:
       retries: 20
     restart: unless-stopped
 
-  # Live recognition: one DeepStream graph (decode, SCRFD, tracker, ArcFace, OSD, JPEG encode).
+  # Recognition: a live DeepStream graph (decode, SCRFD, tracker, ArcFace, OSD, JPEG encode) and a
+  # small second graph for still images (registration, group photos, explanations). Same models.
   pipeline:
     build: ./pipeline
     environment:
@@ -76,24 +75,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    restart: unless-stopped
-
-  # Still images: embeddings for registration, group photos and explanations. CPU is enough.
-  enroll:
-    build:
-      context: ./enroll
-      args:
-        BASE_IMAGE: ${ENROLL_BASE_IMAGE:-ubuntu:22.04}
-        ORT_PACKAGE: ${ORT_PACKAGE:-onnxruntime}
-        MODEL_PACK: buffalo_l
-    environment:
-      <<: *service-env
-      ORT_PROVIDERS: ${ORT_PROVIDERS:-CPUExecutionProvider}
-    volumes:
-      - appdata:/data
-    depends_on:
-      backend:
-        condition: service_healthy
     restart: unless-stopped
 
   frontend:

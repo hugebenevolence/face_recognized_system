@@ -1,5 +1,5 @@
-"""Thin client for the enrollment service, which embeds still images (registration, explanations).
-The live video comes from the DeepStream pipeline service and is proxied in routers/stream.py."""
+"""Thin client for the DeepStream pipeline service's still-image endpoints (registration, group
+photos, explanations). The live video is proxied separately in routers/stream.py."""
 
 import json
 from typing import Optional
@@ -27,7 +27,7 @@ def _box_field(box: Optional[list[float]]) -> dict:
 
 def _post(path: str, *, files: dict, data: Optional[dict] = None, timeout: float = 60) -> httpx.Response:
     try:
-        return httpx.post(f"{settings.enroll_url}{path}", files=files, data=data or {}, timeout=timeout)
+        return httpx.post(f"{settings.pipeline_url}{path}", files=files, data=data or {}, timeout=timeout)
     except httpx.HTTPError as exc:
         raise PipelineUnavailable("Recognition service is unreachable") from exc
 
@@ -65,6 +65,6 @@ def explain(aligned: bytes, crop: Optional[bytes], payload: dict) -> dict:
 
 def status() -> dict:
     try:
-        return httpx.get(f"{settings.enroll_url}/status", timeout=5).json()
+        return httpx.get(f"{settings.pipeline_url}/status", timeout=5).json()
     except (httpx.HTTPError, ValueError) as exc:
         raise PipelineUnavailable("Recognition service is unreachable") from exc
