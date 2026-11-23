@@ -1,4 +1,12 @@
-"""Pipeline service: owns the models, runs the video loop, serves MJPEG + /embed."""
+"""Pipeline service: runs the DeepStream graphs and serves their video, status and still-image
+analysis over HTTP.
+
+  live graph   video source -> detect -> track -> embed -> draw      (runner.py, analytics.py)
+  still graph  one photo at a time -> detect / embed                 (still_graph.py, engine.py)
+
+Both graphs use the same two TensorRT models, so a face registered from a photo and the same
+face seen on camera are embedded by the same code.
+"""
 
 import asyncio
 import json
@@ -9,36 +17,40 @@ from typing import Literal, Optional
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .config import cfg
+from .engine import FaceEngine
 from .explain import explain
-from .face_engine import FaceEngine
 from .runner import Runner, SourceSpec
 from .sources import list_file_sources, public_uri, validate_uri
+from .still_graph import GraphNotReady, StillGraph
 from .stills import describe, find_faces
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("pipeline")
 
-engine: FaceEngine
 runner: Runner
-
+engine: FaceEngine
 BOUNDARY = b"frame"
+MAX_INGEST_FRAME = 2 * 1024 * 1024
+MAX_FACES = 60
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global engine, runner
-    engine = FaceEngine(cfg)
-    runner = Runner(cfg, engine)
+    global runner, engine
+    runner = Runner(cfg)
     runner.start()
+    graph = StillGraph(cfg, runner.engines_ready)
+    graph.start()
+    engine = FaceEngine(cfg, graph)
     yield
+    graph.stop()
     runner.stop()
 
 
-app = FastAPI(title="Face Pipeline", lifespan=lifespan)
+app = FastAPI(title="Face Pipeline (DeepStream)", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -59,9 +71,10 @@ def status():
         "fps": runner.fps,
         "error": runner.last_error,
         "model": cfg.model_pack,
-        "providers": list(cfg.providers),
+        "engine": "DeepStream / TensorRT",
         "match_threshold": cfg.match_threshold,
         "explain_overlay": runner.explain_overlay,
+        "stills_ready": engine.ready,
     }
 
 
@@ -75,10 +88,7 @@ def sources():
     src = runner.source
     return {
         "presets": [dict(p) for p in cfg.source_presets] + list_file_sources(),
-        "current": {
-            "kind": src.kind,
-            "uri": None if src.kind == "browser" else public_uri(src.uri),
-        },
+        "current": {"kind": src.kind, "uri": None if src.kind == "browser" else public_uri(src.uri)},
     }
 
 
@@ -93,9 +103,6 @@ def set_source(body: SourceIn):
             raise HTTPException(422, str(exc)) from exc
         runner.set_source(SourceSpec("uri", uri))
     return sources()["current"]
-
-
-MAX_INGEST_FRAME = 2 * 1024 * 1024
 
 
 @app.websocket("/ingest")
@@ -143,7 +150,27 @@ def snapshot():
     return Response(jpeg, media_type="image/jpeg")
 
 
+class OverlayIn(BaseModel):
+    explain: bool
+
+
+@app.get("/overlay")
+def get_overlay():
+    return {"explain": runner.explain_overlay}
+
+
+@app.put("/overlay")
+def set_overlay(body: OverlayIn):
+    runner.explain_overlay = body.explain
+    return {"explain": runner.explain_overlay}
+
+
 # ---------------------------------------------------------------- stills: register / analyse
+@app.exception_handler(GraphNotReady)
+async def _not_ready(_request, exc: GraphNotReady):
+    return JSONResponse({"detail": str(exc)}, status_code=503)
+
+
 def _decode(file: UploadFile) -> np.ndarray:
     img = cv2.imdecode(np.frombuffer(file.file.read(), np.uint8), cv2.IMREAD_COLOR)
     if img is None:
@@ -166,7 +193,7 @@ def _parse_box(box: Optional[str]) -> Optional[tuple]:
 def _similar(emb: np.ndarray) -> list[dict]:
     return [
         {"person_id": m.person_id, "name": m.name, "code": m.code, "score": round(m.score, 4)}
-        for m in runner.matcher.top_matches(emb, engine.pack, k=3)
+        for m in runner.analytics.matcher.top_matches(emb, cfg.model_pack, k=3)
     ]
 
 
@@ -185,7 +212,7 @@ def embed(file: UploadFile = File(...), box: Optional[str] = Form(None)):
     if best.size < 60:
         raise HTTPException(422, "Face is too small. It needs at least 60 px")
     aligned = engine.align(img, best)
-    emb = engine.embed_aligned(aligned)
+    emb = engine.embed(img, best)
     info = describe(engine, img, best, aligned)
     return {
         "model": engine.pack,
@@ -194,6 +221,7 @@ def embed(file: UploadFile = File(...), box: Optional[str] = Form(None)):
         "face_count": len(dets),
         "image_size": [int(img.shape[1]), int(img.shape[0])],
         "bbox": info["box"],
+        "pipeline": "deepstream",
         **info,
     }
 
@@ -222,20 +250,16 @@ def analyze(file: UploadFile = File(...), box: Optional[str] = Form(None)):
     }
 
 
-MAX_FACES = 60
-
-
 @app.post("/probe")
 def probe(file: UploadFile = File(...)):
     """Cheap per-frame check used while capturing from a camera: is there exactly one
-    usable face and how is it posed? (live detector size, no embedding, no PNGs)"""
+    usable face and how is it posed? (detection only, no embedding)"""
     img = _decode(file)
     dets = engine.detect(img)
     if not dets:
         return {"faces": 0}
     best = max(dets, key=lambda d: d.area)
-    aligned = engine.align(img, best)
-    d = describe(engine, img, best, aligned)
+    d = describe(engine, img, best, engine.align(img, best))
     return {
         "faces": len(dets),
         "box": d["box"],
@@ -259,9 +283,8 @@ def compare(files: list[UploadFile] = File(...)):
             items.append({"ok": False})
             continue
         best = max(dets, key=lambda d: d.area)
-        aligned = engine.align(img, best)
-        embs.append(engine.embed_aligned(aligned))
-        q = describe(engine, img, best, aligned)["quality"]
+        embs.append(engine.embed(img, best))
+        q = describe(engine, img, best, engine.align(img, best))["quality"]
         items.append(
             {"ok": True, "yaw_ratio": q["metrics"]["yaw_ratio"], "quality": q["overall"], "faces": len(dets)}
         )
@@ -277,7 +300,7 @@ def explain_face(
     crop: Optional[UploadFile] = File(None),
 ):
     """Occlusion-sensitivity maps. `payload`: {"refs": [[512 floats]...], "bbox": [...], "kps": [[x,y]*5]}
-    where bbox/kps are relative to `crop`. Heavy (tens of model passes): call on demand."""
+    where bbox/kps are relative to `crop`. Heavy (tens of passes through the graph): on demand only."""
     try:
         p = json.loads(payload)
     except ValueError:
@@ -297,18 +320,3 @@ def explain_face(
     if c is not None and not (p.get("bbox") and p.get("kps")):
         c = None
     return explain(engine, a, c, p.get("bbox"), p.get("kps"), refs)
-
-
-class OverlayIn(BaseModel):
-    explain: bool
-
-
-@app.get("/overlay")
-def get_overlay():
-    return {"explain": runner.explain_overlay}
-
-
-@app.put("/overlay")
-def set_overlay(body: OverlayIn):
-    runner.explain_overlay = body.explain
-    return {"explain": runner.explain_overlay}

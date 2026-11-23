@@ -1,37 +1,30 @@
-# CPU:  BASE_IMAGE=ubuntu:22.04                                 ORT_PACKAGE=onnxruntime
-# GPU:  BASE_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 ORT_PACKAGE=onnxruntime-gpu
-# (docker-compose.gpu.yml sets the GPU values)
-ARG BASE_IMAGE=ubuntu:22.04
-FROM ${BASE_IMAGE}
+# DeepStream 7.1 runtime: GStreamer + nvinfer/TensorRT/nvtracker/nvdsosd, plus the Python bindings.
+# Needs an NVIDIA GPU (Docker Desktop + WSL2, or the NVIDIA Container Toolkit on Linux).
+FROM nvcr.io/nvidia/deepstream:7.1-samples-multiarch
 
-ARG ORT_PACKAGE=onnxruntime
-ARG MODEL_PACK=buffalo_l
-ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 GIO_USE_PROXY_RESOLVER=dummy
 
-# python3-gi/gst bindings must come from apt so they match the system GStreamer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-dev build-essential \
-        python3-gi python3-gst-1.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
-        gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
-        fonts-dejavu-core libglib2.0-0 \
+        libpython3.10 python3-gi python3-gst-1.0 unzip ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /srv
-
-# insightface compiles a Cython extension and needs numpy/cython visible at build time.
-COPY constraints.txt .
-ENV PIP_CONSTRAINT=/srv/constraints.txt
-RUN pip3 install --upgrade pip setuptools wheel numpy==1.26.4 "cython<3.1"
+WORKDIR /app
 COPY requirements.txt .
-RUN pip3 install --no-build-isolation insightface==0.7.3 \
-    && pip3 install ${ORT_PACKAGE}==1.19.2 \
-    && pip3 install -r requirements.txt
+RUN pip3 install -r requirements.txt \
+    && pip3 install https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.0/pyds-1.2.0-cp310-cp310-linux_x86_64.whl
 
-# Bake the model weights into the image so first start needs no network.
-RUN python3 -c "from insightface.app import FaceAnalysis; \
-FaceAnalysis(name='${MODEL_PACK}', allowed_modules=['detection','recognition'], providers=['CPUExecutionProvider'])"
+# Face models (insightface buffalo_l) converted for TensorRT. TensorRT engines are built on
+# first start and cached in the /models volume.
+COPY prepare_models.py .
+RUN mkdir -p /tmp/pack /opt/models \
+    && curl -fsSL -o /tmp/pack/buffalo_l.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip \
+    && unzip -q -j /tmp/pack/buffalo_l.zip det_10g.onnx w600k_r50.onnx -d /tmp/pack \
+    && python3 prepare_models.py /tmp/pack /opt/models \
+    && rm -rf /tmp/pack
 
+COPY configs ./configs
 COPY app ./app
+COPY entrypoint.sh .
 EXPOSE 8090
+ENTRYPOINT ["./entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]

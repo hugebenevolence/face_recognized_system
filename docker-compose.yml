@@ -1,17 +1,15 @@
-# Face Recognition stack.
-#   CPU :  docker compose up --build
-#   GPU :  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+# Face Recognition stack. Recognition runs on DeepStream, so an NVIDIA GPU is required.
+#   docker compose up --build
 #   + simulated RTSP camera from ./samples/demo.mp4 :  add  --profile sim
 name: face-recognition
 
-x-pipeline-env: &pipeline-env
+x-service-env: &service-env
   DATABASE_URL: postgresql://${POSTGRES_USER:-face}:${POSTGRES_PASSWORD:-face}@db:5432/${POSTGRES_DB:-face}
   BACKEND_URL: http://backend:8000
   INTERNAL_TOKEN: ${INTERNAL_TOKEN:-change-me}
   DATA_DIR: /data
   CAMERA_ID: ${CAMERA_ID:-cam1}
-  SOURCE_URI: ${SOURCE_URI:-rtsp://mediamtx:8554/cam1}
-  MODEL_PACK: ${MODEL_PACK:-buffalo_s}
+  MODEL_PACK: buffalo_l
   MATCH_THRESHOLD: ${MATCH_THRESHOLD:-0.40}
 
 services:
@@ -53,24 +51,30 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # Recognition: a live DeepStream graph (decode, SCRFD, tracker, ArcFace, OSD, JPEG encode) and a
+  # small second graph for still images (registration, group photos, explanations). Same models.
   pipeline:
-    build:
-      context: ./pipeline
-      args:
-        BASE_IMAGE: ${PIPELINE_BASE_IMAGE:-ubuntu:22.04}
-        ORT_PACKAGE: ${ORT_PACKAGE:-onnxruntime}
-        MODEL_PACK: ${MODEL_PACK:-buffalo_s}
+    build: ./pipeline
     environment:
-      <<: *pipeline-env
-      ORT_PROVIDERS: ${ORT_PROVIDERS:-CPUExecutionProvider}
+      <<: *service-env
+      SOURCE_URI: ${SOURCE_URI:-rtsp://mediamtx:8554/cam1}
+      RTSP_OUT_URL: ${RTSP_OUT_URL:-}
     volumes:
       - appdata:/data
+      - models:/models
       - ./samples:/samples:ro
     ports:
       - "8090:8090"
     depends_on:
       backend:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
 
   frontend:
@@ -85,7 +89,8 @@ services:
       - backend
     restart: unless-stopped
 
-  # Simulated RTSP camera: loops ./samples/demo.mp4 as rtsp://mediamtx:8554/cam1
+  # RTSP server. With profile "sim" it loops ./samples/demo.mp4 as rtsp://mediamtx:8554/cam1.
+  # Publish a host webcam to it as well (see README).
   mediamtx:
     profiles: ["sim"]
     image: bluenviron/mediamtx:1.9.3-ffmpeg
@@ -98,8 +103,9 @@ services:
     volumes:
       - ./samples:/samples:ro
     ports:
-      - "8554:8554"   # lets you also publish a host webcam: see README
+      - "8554:8554"
 
 volumes:
   pgdata:
   appdata:
+  models:

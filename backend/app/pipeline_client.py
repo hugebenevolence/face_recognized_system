@@ -1,4 +1,5 @@
-"""Thin client for the pipeline service, which owns the face models."""
+"""Thin client for the DeepStream pipeline service's still-image endpoints (registration, group
+photos, explanations). The live video is proxied separately in routers/stream.py."""
 
 import json
 from typing import Optional

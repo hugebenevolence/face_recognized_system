@@ -1,4 +1,4 @@
-# Real-time Face Recognition (GStreamer + FastAPI + Next.js + pgvector)
+# Real-time Face Recognition (DeepStream + FastAPI + Next.js + pgvector)
 
 Register faces in a web UI, watch a live video stream with recognised names drawn on it, and browse a searchable history of every recognition event.
 
@@ -6,18 +6,47 @@ Register faces in a web UI, watch a live video stream with recognised names draw
 
 **User guide:** [`docs/USER_GUIDE.pdf`](docs/USER_GUIDE.pdf) (two pages with screenshots; LaTeX source in [`docs/`](docs/)).
 
+| Service    | Tech                                                                    | Port |
+|------------|-------------------------------------------------------------------------|------|
+| `db`       | `pgvector/pgvector:pg16`                                                | -    |
+| `backend`  | FastAPI, SQLAlchemy 2, pgvector                                         | 8000 |
+| `pipeline` | **NVIDIA DeepStream 7.1** (GStreamer, nvinfer / TensorRT, nvtracker), pyds. Live video and still images | 8090 |
+| `frontend` | Next.js 14 (App Router)                                                 | 3000 |
+| `mediamtx` | optional simulated RTSP camera (`--profile sim`)                        | 8554 |
 
-| Service    | Tech                                              | Port |
-|------------|---------------------------------------------------|------|
-| `db`       | `pgvector/pgvector:pg16`                          | -    |
-| `backend`  | FastAPI, SQLAlchemy 2, pgvector                   | 8000 |
-| `pipeline` | GStreamer (PyGObject), insightface (SCRFD+ArcFace) on ONNX Runtime | 8090 |
-| `frontend` | Next.js 14 (App Router)                           | 3000 |
-| `mediamtx` | optional simulated RTSP camera (`--profile sim`)  | 8554 |
+## The video pipeline
+
+Detection, tracking, recognition, drawing and encoding all run **inside one DeepStream (GStreamer) graph**, on the GPU:
+
+```
+source ──► nvstreammux ──► nvinfer SCRFD ──► nvtracker ──► nvinfer ArcFace ──► nvdsosd ──► nvjpegenc ──► MJPEG to the browser
+(RTSP,      batches        face boxes +      stable ids    512-d embedding     draws boxes     (optional: nvv4l2h264enc
+ file,      frames         5 landmarks       per face      per tracked face    and labels       ──► rtspclientsink)
+ browser)
+                                 probe 1: decode        probe 2: ROI        probe 3: match in pgvector,
+                                 SCRFD tensors          from landmarks      label, post events
+```
+
+* **SCRFD** (face detector) and **ArcFace** (`w600k_r50`, 512-d embedding) run as `nvinfer` elements on TensorRT (FP16). The engines are built on first start and cached in the `models` volume.
+* **`nvtracker`** gives each face a stable id, so the embedding is computed once per few frames per person and each appearance produces one event.
+* Three small **pad probes** (`pipeline/app/analytics.py`) handle the metadata: decode SCRFD's raw tensors into boxes and landmarks, point the ArcFace region at the face (computed from the landmarks), then read the embedding, match it with pgvector and label the box. Matching and event delivery stay in Python because they talk to PostgreSQL and the backend.
+* Video reaches the browser as MJPEG through the backend (`/api/stream.mjpg`). Set `RTSP_OUT_URL` to also publish the annotated stream as H.264 over RTSP.
+
+### Registration uses the same pipeline
+
+Photos (registration, group photos, camera captures) and the explanation maps go through a second, small DeepStream graph that lives in the same container and shares the two models:
+
+```
+photo ──► view (640x640) ──► nvstreammux ──► nvinfer SCRFD ──► nvinfer ArcFace ──► embedding
+          tiles for big      batch of 1       finds faces        runs on the face    stored in pgvector
+          group photos                        (detect request)   region (embed request)
+```
+
+A face registered from a photo is therefore embedded by the same `nvinfer` elements and the same landmark crop as the same face on camera (`pipeline/app/still_graph.py`, `engine.py`). Large photos are cut into overlapping tiles so small faces keep their pixels. The occlusion maps pack many masked 112x112 faces into one view (a mosaic) and ArcFace embeds all of them in one pass.
 
 ## Quick start
 
-Requirements: Docker with Compose v2. For GPU: an NVIDIA GPU + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) (on Windows: Docker Desktop with the WSL2 backend).
+Requirements: Docker with Compose v2 and an **NVIDIA GPU** (DeepStream has no CPU mode) with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) (on Windows: Docker Desktop with the WSL2 backend). Disk: the DeepStream base image is about 20 GB.
 
 ### 1. Provide a video source
 
@@ -26,14 +55,10 @@ Easiest is a simulated RTSP camera: put any MP4 containing faces at `samples/dem
 ### 2. Start
 
 ```bash
-# CPU
 docker compose --profile sim up --build
-
-# NVIDIA GPU
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile sim up --build
 ```
 
-The first build downloads the model weights and takes several minutes. Then open <http://localhost:3000>.
+The first start builds the TensorRT engines, which takes a few minutes (cached afterwards). Registration waits for that to finish. Then open <http://localhost:3000>.
 
 ### 3. Try it
 
@@ -47,12 +72,10 @@ The **Live** page has a camera picker. Switching is instant (no restart):
 
 | Option | How it works |
 |---|---|
-| **This device (browser)** | Lists the cameras your browser can see (webcam, USB, phone-as-webcam such as Camo). Click *Detect cameras* once to grant permission so names show up, pick one, then *Use this camera*. The page captures frames (~10 fps, max 960 px wide) and streams them as JPEG over a WebSocket (`/api/ws/camera`) to the pipeline. **Keep the tab open** while it streams. Needs `http://localhost` or HTTPS. |
-| **Server sources** | RTSP presets, any video in `./samples/` (looped), or a custom `rtsp://` URL. The pipeline pulls these itself through GStreamer. |
+| **This device (browser)** | Lists the cameras your browser can see (webcam, USB, phone-as-webcam such as Camo). Click *Detect cameras* once to grant permission so names show up, pick one, then *Use this camera*. The page captures frames (~10 fps, max 960 px wide) and streams them as JPEG over a WebSocket (`/api/ws/camera`) into the graph (`appsrc ! jpegparse ! nvjpegdec`). **Keep the tab open** while it streams. Needs `http://localhost` or HTTPS. |
+| **Server sources** | RTSP presets, any video in `./samples/` (looped, paced to real time), or a custom `rtsp://` URL. The graph reads these itself (`rtspsrc` or `uridecodebin`, hardware decode with `nvv4l2decoder`). |
 
-Browser frames are decoded with OpenCV rather than GStreamer (they are already individual JPEGs); detection, tracking, recognition and event logging are identical for every source. The choice lasts until the pipeline container restarts, then it falls back to `SOURCE_URI`.
-
-For safety the source endpoint only accepts `rtsp(s)://` URLs and video files under `/samples`.
+Detection, tracking, recognition and event logging are identical for every source. The choice lasts until the pipeline container restarts, then it falls back to `SOURCE_URI`. For safety the source endpoint only accepts `rtsp(s)://` URLs and video files under `/samples`.
 
 ## Other video sources
 
@@ -60,19 +83,19 @@ Set `SOURCE_URI` in `.env` (copy `.env.example`) for the default source at start
 
 | Source               | `SOURCE_URI`                                       |
 |----------------------|----------------------------------------------------|
-| Real RTSP camera     | `rtsp://user:pass@192.168.1.10:554/stream`         |
+| Real RTSP camera     | `rtsp://user:pass@192.168.1.10:554/stream` (H.264) |
 | Video file (looped)  | `/samples/demo.mp4` (and drop `--profile sim`)     |
-| Linux webcam         | `v4l2:/dev/video0` + pass the device to `pipeline` |
 
 **Windows/macOS webcam**: Docker can't see the host webcam. The simplest fix is the *This device (browser)* option above. Alternatively, run `scripts\publish-webcam.bat ["Camera name"]` on the host (needs ffmpeg) to publish it to the bundled RTSP server (`--profile sim`), then choose *Host webcam via RTSP* in the picker or set `SOURCE_URI=rtsp://mediamtx:8554/webcam`.
 
 ## How recognition works
 
-- **Detection**: SCRFD. **Embedding**: ArcFace (512-d, L2-normalised). Both come from insightface's `buffalo_l` pack (`MODEL_PACK=buffalo_s` for a lighter one).
+- **Detection**: SCRFD. **Embedding**: ArcFace (512-d, L2-normalised). Both come from insightface's `buffalo_l` pack, converted to TensorRT by `nvinfer`.
 - **Matching**: cosine similarity via pgvector (`<=>` operator, HNSW index). A face is *known* if similarity ≥ `MATCH_THRESHOLD` (default 0.40), otherwise *Unknown*.
-- **Tracking**: an IoU tracker gives each face a stable ID, so the embedding is computed only every few frames per face, not every frame, and each appearance produces **one** event (re-logged after `EVENT_COOLDOWN` seconds if the person stays in view, or immediately if their status changes).
-- **Events** are posted by the pipeline to the backend, which stores them in PostgreSQL (timestamp, person or Unknown, confidence, camera, snapshot path) and pushes them to browsers over `WS /ws/events`.
+- **Tracking**: `nvtracker` (IOU) gives each face a stable ID. The probe lets a face through to ArcFace every `ID_INTERVAL` frames (5) while it is unresolved and every `REID_INTERVAL` frames (45) once known. Each appearance produces **one** event (re-logged after `EVENT_COOLDOWN` seconds if the person stays in view, or immediately if their status changes).
+- **Events** are posted by the pipeline to the backend, which stores them in PostgreSQL (timestamp, person or Unknown, confidence, camera, snapshot path, evidence) and pushes them to browsers over `WS /ws/events`.
 - Snapshots and registered images are stored on the `appdata` volume and served at `/files/...`.
+- **Registration and live video use the same pipeline.** Photos are embedded by the still-image graph, live faces by the live graph. Both use the same ArcFace engine and the same landmark crop, so the vectors are directly comparable. As a check, 6 faces of a test video were found in one still frame and every stored registration photo re-embedded through the graph matched its stored vector with cosine similarity 0.88 to 0.99 (most above 0.97; the stored vectors came from an earlier ONNX Runtime version with full alignment).
 
 ## API
 
@@ -125,37 +148,38 @@ angles can only help recall; poor frames can hurt, which is why every shot is qu
   the detected face + landmarks, the aligned crop, quality, the closest people with their scores against the
   threshold and the margin to the runner-up.
 * **Explain on video**: the *Explain overlay* switch above the live video draws the 5 landmarks, the detection score and
-  `similarity / threshold` on every face.
+  `similarity / threshold` on every face (drawn by `nvdsosd` from display metadata).
 * **Which regions matter** (on demand): *Explain regions* hides one patch at a time (occlusion
   sensitivity) and measures how far the score falls: for recognition (similarity to the matched person)
-  and for detection (detector confidence). It runs on the stored crops, never on the live stream, and is
+  and for detection (detector confidence). It runs in the still-image graph on the stored crops, never on the live stream, and is
   cached. It shows *model sensitivity*, not human-style reasons, and depends on patch size.
 
-## CPU or GPU
+## Performance
 
-`docker compose up` (CPU) defaults to `MODEL_PACK=buffalo_s`; the GPU override defaults to `buffalo_l`.
-Measured on a Ryzen 5 5600H (12 threads): `buffalo_l` ≈ 190 ms detect + 100 ms/face embed, `buffalo_s`
-≈ 35 ms + 15 ms/face. **Embeddings of different model packs are not comparable.** After switching, open
-**Faces**: a banner offers *Update* (or `POST /api/admin/reanalyze`), which embeds every stored photo again
-with the current model. Photos are kept, so nothing is lost.
+Measured on a laptop with an RTX 3050 (4 GB), 1280x720 input, one face in view, Docker Desktop on WSL2: the whole graph
+(decode, SCRFD, tracker, ArcFace, drawing, JPEG encode) ran at about 105 frames per second with an unpaced file source, so real-time
+sources (25 to 30 fps) have plenty of headroom. The first start builds the TensorRT engines (about 4 minutes for both models);
+later starts load them from the cache in about 2 seconds.
 
 ## Configuration
 
-All optional; see `.env.example`. Tuning knobs for the pipeline (`MATCH_THRESHOLD`, `DET_SIZE`, `ID_INTERVAL`, `EVENT_COOLDOWN`, ...) are read in `pipeline/app/config.py`.
+All optional; see `.env.example`. Tuning knobs for the pipeline (`MATCH_THRESHOLD`, `DET_THRESH`, `MIN_FACE_PX`, `REID_INTERVAL`, `EVENT_COOLDOWN`, ...) are read in `pipeline/app/config.py`.
 
 ## Design notes & limitations
 
-- **GStreamer rather than DeepStream.** The task allows either. DeepStream needs a large NGC image and a custom face-recognition plugin chain; the GStreamer + ONNX Runtime design runs on CPU or any NVIDIA GPU and is easy to reproduce. Models run on ONNX Runtime (CUDA provider when the GPU override is used).
+- **Why DeepStream.** Inference, tracking and drawing are elements of the GStreamer graph and run on the GPU without leaving it, instead of pulling frames into application code. The cost is an NVIDIA-only, roughly 20 GB base image.
+- **SCRFD output is decoded in a pad probe.** `nvinfer` runs the network, but its stock parser interface cannot return the five landmarks, so the raw tensors are decoded in Python (`app/scrfd.py`). A C++ parser would be faster but is not needed at this scale.
+- **Alignment without rotation.** `nvinfer` can only crop axis-aligned regions, so the ArcFace input is a landmark-derived crop (scale and position corrected, rotation not). On the registered test photos this scored within about 1% of full alignment for upright faces, and clearly better than a plain box crop (about 0.74 against 0.48 same-person similarity). Strongly tilted heads lose some accuracy.
+- The ArcFace region must lie fully inside the frame, so a face cut by the image border keeps its previous identity but is not re-embedded.
+- RTSP cameras must send H.264. Single camera per pipeline container.
 - Tables are created at backend start-up (`create_all`) plus a few idempotent `ALTER TABLE ... IF NOT EXISTS` for columns added later; there is no migration tool yet.
-- No authentication on the API; it is meant for a trusted network. The pipeline → backend channel uses a shared secret (`INTERNAL_TOKEN`).
-- Single camera per pipeline container.
-- Detection runs on every frame; if the machine is too slow, frames are dropped (appsink `drop=true`) rather than queued, so latency stays low.
+- No authentication on the API; it is meant for a trusted network. The pipeline to backend channel uses a shared secret (`INTERNAL_TOKEN`).
 
 ## Project layout
 
 ```
-backend/    FastAPI app (models, routers, WebSocket, pipeline client)
-pipeline/   GStreamer loop, face engine, tracker, matcher, event publisher
+backend/    FastAPI app (models, routers, WebSocket, client for the pipeline service)
+pipeline/   DeepStream: live graph (runner.py, analytics.py), still-image graph (still_graph.py, engine.py, stills.py, explain.py), SCRFD decoder, nvinfer/tracker configs
 frontend/   Next.js UI (live, faces, history)
 samples/    put demo.mp4 here
 ```
