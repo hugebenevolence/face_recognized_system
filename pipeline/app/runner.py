@@ -1,9 +1,10 @@
 """Builds and supervises the DeepStream graph.
 
     source -> nvstreammux -> nvinfer SCRFD -> nvtracker -> nvvideoconvert (RGBA)
-           -> nvdspreprocess (face alignment) -> nvinfer ArcFace -> nvdsosd
-           -> tee -+-> nvjpegenc -> appsink                (MJPEG for the browser)
-                   +-> nvv4l2h264enc -> rtspclientsink     (optional RTSP out)
+           -> nvdspreprocess (face alignment) -> nvinfer ArcFace -> split
+    split -+-> [probe: only needed frames] -> nvjpegenc -> appsink   (clean frames: snapshots, events)
+           +-> nvdsosd -> tee -+-> nvjpegenc -> appsink              (MJPEG for the browser)
+                               +-> nvv4l2h264enc -> rtspclientsink  (optional RTSP out)
 
 Detection, tracking, face alignment, embedding, drawing and encoding all run inside the graph on
 the GPU. Python wires the elements and handles the metadata in three pad probes (analytics.py).
@@ -16,9 +17,10 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import cv2
+import io
+
 import gi
-import numpy as np
+from PIL import Image, ImageDraw
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
@@ -42,11 +44,21 @@ class SourceSpec:
 
 
 def placeholder_jpeg(text: str) -> bytes:
-    img = np.full((540, 960, 3), (32, 26, 24), np.uint8)
-    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-    cv2.putText(img, text, ((960 - w) // 2, (540 + h) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (170, 156, 150), 2, cv2.LINE_AA)
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    return buf.tobytes() if ok else b""
+    """Grey frame with a message, shown while there is no video."""
+    img = Image.new("RGB", (960, 540), (24, 26, 32))
+    draw = ImageDraw.Draw(img)
+    font = None
+    try:
+        from PIL import ImageFont
+
+        font = ImageFont.load_default(size=28)
+    except Exception:
+        pass
+    x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+    draw.text(((960 - (x1 - x0)) // 2, (540 - (y1 - y0)) // 2), text, fill=(150, 156, 170), font=font)
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=80)
+    return out.getvalue()
 
 
 def _make(factory: str, name: Optional[str] = None, **props) -> Gst.Element:
@@ -113,11 +125,8 @@ class Runner(threading.Thread):
             return self._jpeg, self._jpeg_seq
 
     def latest_raw_jpeg(self) -> Optional[bytes]:
-        raw = self.analytics.last_raw
-        if raw is None:
-            return None
-        ok, buf = cv2.imencode(".jpg", raw, [cv2.IMWRITE_JPEG_QUALITY, self.cfg.jpeg_quality])
-        return buf.tobytes() if ok else None
+        """Newest clean (not drawn on) frame, JPEG-encoded on the GPU."""
+        return self.analytics.last_snapshot
 
     @property
     def fps(self) -> float:
@@ -187,8 +196,17 @@ class Runner(threading.Thread):
         align = _make("nvdspreprocess", "align", config_file=str(cfg.config_dir / "preprocess_arcface.txt"))
         sgie = _make("nvinfer", "sgie", config_file_path=str(cfg.config_dir / "sgie_arcface.txt"), unique_id=2,
                      input_tensor_meta=True)
+        split = _make("tee", "split")
         osd = _make("nvdsosd", "osd", display_text=True)
         tee = _make("tee", "tee")
+
+        # branch 0: clean frames (before drawing), only those the analytics asks for. It is linked
+        # first and has no queue, so tee converts the frame here before nvdsosd draws on it.
+        c0 = _make("nvvideoconvert", "conv_clean")
+        f0 = _caps("video/x-raw(memory:NVMM),format=I420")
+        jpg0 = _make("nvjpegenc", "jpeg_clean", quality=90)
+        sink0 = _make("appsink", "sink_clean", emit_signals=True, max_buffers=8, drop=False, sync=False)
+        sink0.connect("new-sample", self._on_clean)
 
         # branch 1: JPEG frames for the browser
         q1 = _make("queue", "q_jpeg", leaky=2, max_size_buffers=2)
@@ -198,11 +216,13 @@ class Runner(threading.Thread):
         sink = _make("appsink", "sink", emit_signals=True, max_buffers=1, drop=True, sync=False)
         sink.connect("new-sample", self._on_sample)
 
-        chain = [mux, _make("queue", "q_mux"), pgie, tracker, conv, rgba, align, sgie, osd, tee]
-        for el in chain + [q1, c1, f1, jpg, sink]:
+        chain = [mux, _make("queue", "q_mux"), pgie, tracker, conv, rgba, align, sgie, split]
+        for el in chain + [c0, f0, jpg0, sink0, osd, tee, q1, c1, f1, jpg, sink]:
             pipe.add(el)
         for a, b in zip(chain, chain[1:]):
             a.link(b)
+        split.link(c0), c0.link(f0), f0.link(jpg0), jpg0.link(sink0)  # first pad of split
+        split.link(osd), osd.link(tee)
         tee.link(q1)
         q1.link(c1), c1.link(f1), f1.link(jpg), jpg.link(sink)
 
@@ -214,6 +234,7 @@ class Runner(threading.Thread):
         pgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_detect, None)
         tracker.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_tracked, None)
         sgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_identify, None)
+        c0.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, an.clean_gate, None)
         return pipe
 
     def _add_rtsp_out(self, pipe: Gst.Pipeline, tee: Gst.Element, url: str) -> None:
@@ -310,6 +331,17 @@ class Runner(threading.Thread):
             self.connected, self.last_error = True, None
             self._times.append(time.monotonic())
             del self._times[:-30]
+        return Gst.FlowReturn.OK
+
+    def _on_clean(self, sink) -> Gst.FlowReturn:
+        sample = sink.emit("pull-sample")
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if ok:
+            try:
+                self.analytics.on_clean_jpeg(buf.pts, bytes(info.data))
+            finally:
+                buf.unmap(info)
         return Gst.FlowReturn.OK
 
     def _set_jpeg(self, jpeg: bytes) -> None:

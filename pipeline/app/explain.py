@@ -13,11 +13,11 @@ import base64
 import threading
 import time
 
-import cv2
 import numpy as np
 
 from .engine import FaceEngine
 from .geometry import TEMPLATE, iou
+from .picture import Picture, png_bytes
 
 # Landmark layout of an aligned ArcFace crop (the fixed 112x112 template).
 ALIGNED_KPS = TEMPLATE.astype(np.float32)
@@ -28,8 +28,18 @@ _gate = threading.Semaphore(1)
 
 
 def _png_b64(img: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".png", img)
-    return base64.b64encode(buf.tobytes()).decode() if ok else ""
+    return base64.b64encode(png_bytes(img)).decode()
+
+
+def _gaussian_blur(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur with mirrored borders (smooths the patch grid of a heat map)."""
+    r = max(1, int(round(3 * sigma)))
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k /= k.sum()
+    out = np.pad(img.astype(np.float32), r, mode="reflect")
+    out = np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), 0, out)
+    out = np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), 1, out)
+    return out
 
 
 def _region_masks(kps: np.ndarray, shape: tuple, face_mask: np.ndarray) -> dict[str, np.ndarray]:
@@ -70,11 +80,11 @@ def _shares(heat: np.ndarray, masks: dict[str, np.ndarray]) -> list[dict]:
 
 def _overlay(heat: np.ndarray, vmax: float) -> str:
     """Transparent PNG: red where hiding the area lowers the score, blue where it raises it."""
-    heat = cv2.GaussianBlur(heat.astype(np.float32), (0, 0), sigmaX=max(1.0, heat.shape[1] / 40))
+    heat = _gaussian_blur(heat, max(1.0, heat.shape[1] / 40))
     pos = np.clip(heat, 0, None) / vmax
     neg = np.clip(-heat, 0, None) / vmax
-    rgba = np.zeros((*heat.shape, 4), np.uint8)  # BGRA
-    rgba[..., :3] = np.where(pos[..., None] >= neg[..., None], (30, 70, 255), (255, 140, 40))
+    rgba = np.zeros((*heat.shape, 4), np.uint8)
+    rgba[..., :3] = np.where(pos[..., None] >= neg[..., None], (255, 70, 30), (40, 140, 255))
     rgba[..., 3] = (np.clip(np.maximum(pos * 0.85, neg * 0.6), 0, 1) * 255).astype(np.uint8)
     return _png_b64(rgba)
 
@@ -126,7 +136,7 @@ def explain_detection(engine: FaceEngine, crop: np.ndarray, bbox, kps) -> dict:
 
     def score_of(img: np.ndarray) -> float:
         best = 0.0
-        for d in engine.detect(img):
+        for d in engine.detect(Picture.from_rgb(img)):
             if iou(d.box, target) >= 0.3:
                 best = max(best, d.score)
         return best

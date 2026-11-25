@@ -16,8 +16,10 @@ symmetric-padding=0
 # the plugin's own per-object scaling (unused by the tensor, kept small)
 processing-width=112
 processing-height=112
-scaling-buf-pool-size=8
-tensor-buf-pool-size=8
+# every 4 faces of a frame hold one scaling and one tensor buffer until the frame is done, so a
+# pool must be at least (faces per frame / batch size) (nvdspreprocess README): 32 = up to 128 faces
+scaling-buf-pool-size=32
+tensor-buf-pool-size=32
 # NCHW, batch of 4 faces (the ArcFace TensorRT engine is built for batch 1 to 4)
 network-input-order=0
 network-input-shape=4;3;112;112

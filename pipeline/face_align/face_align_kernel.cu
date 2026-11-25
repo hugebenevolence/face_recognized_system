@@ -1,14 +1,17 @@
-/* CUDA part of face_align: the warp + normalise kernel (kept apart from the DeepStream and glib
- * headers, which nvcc cannot parse). */
+/* CUDA part of face_align: the warp kernel (kept apart from the DeepStream and glib headers,
+ * which nvcc cannot parse). */
 #include <cuda_runtime.h>
 
 #include "face_align_kernel.h"
 
-/* One thread per output pixel: inverse-map into the frame, bilinear sample (zero outside,
- * like cv2.warpAffine with a constant border), normalise, write planar RGB. */
+/* One thread per output pixel: inverse-map into the frame, bilinear sample (zero outside, like
+ * insightface's norm_crop), then write
+ *   - the normalised planar RGB tensor (value - offset) * scale that ArcFace reads, and
+ *   - optionally the same aligned face as 8-bit interleaved RGB (the image ArcFace sees, kept as
+ *     evidence and shown in the interface). */
 __global__ void warp_normalise(const unsigned char *src, int pitch, int src_w, int src_h,
                                float a, float b, float c, float d, float e, float f,
-                               float *out, int out_w, int out_h, float scale,
+                               float *out, unsigned char *rgb, int out_w, int out_h, float scale,
                                float o0, float o1, float o2) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -34,13 +37,16 @@ __global__ void warp_normalise(const unsigned char *src, int pitch, int src_w, i
   out[i] = (acc[0] - o0) * scale;
   out[plane + i] = (acc[1] - o1) * scale;
   out[2 * plane + i] = (acc[2] - o2) * scale;
+  if (rgb != nullptr) {
+    for (int ch = 0; ch < 3; ++ch) rgb[i * 3 + ch] = (unsigned char)fminf(fmaxf(acc[ch] + 0.5f, 0.f), 255.f);
+  }
 }
 
 extern "C" void fa_launch(const unsigned char *src, int pitch, int src_w, int src_h, const float inv[6],
-                          float *out, int out_w, int out_h, float scale, const float offset[3],
-                          cudaStream_t stream) {
+                          float *out, unsigned char *rgb, int out_w, int out_h, float scale,
+                          const float offset[3], cudaStream_t stream) {
   const dim3 block(16, 16), grid((out_w + 15) / 16, (out_h + 15) / 16);
   warp_normalise<<<grid, block, 0, stream>>>(src, pitch, src_w, src_h, inv[0], inv[1], inv[2], inv[3],
-                                             inv[4], inv[5], out, out_w, out_h, scale, offset[0],
+                                             inv[4], inv[5], out, rgb, out_w, out_h, scale, offset[0],
                                              offset[1], offset[2]);
 }

@@ -1,5 +1,11 @@
-"""Saves snapshots and reports recognition events to the backend, off the video thread."""
+"""Saves snapshots and reports recognition events to the backend, off the video thread.
 
+The graph hands over the clean frame as a JPEG it encoded on the GPU (nvjpegenc) and the aligned
+face the alignment library produced. Here the frame is cropped around the face for the stored
+snapshot, and the evidence coordinates are made relative to that crop.
+"""
+
+import io
 import logging
 import queue
 import threading
@@ -8,13 +14,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import cv2
 import httpx
 import numpy as np
+from PIL import Image
 
 from .config import Config
+from .picture import png_bytes
 
 log = logging.getLogger("events")
+SNAPSHOT_MARGIN = 0.6  # of the face size, on each side
 
 
 class EventPublisher(threading.Thread):
@@ -31,17 +39,22 @@ class EventPublisher(threading.Thread):
         person_id: Optional[int],
         confidence: float,
         track_id: int,
-        snapshot: np.ndarray,
+        frame_jpeg: bytes,
+        box: tuple,
+        kps: np.ndarray,
         evidence: Optional[dict] = None,
         aligned: Optional[np.ndarray] = None,
     ) -> None:
+        """`frame_jpeg` is the whole clean frame; `box` and `kps` are in frame pixels."""
         item = dict(
             ts=datetime.now(timezone.utc),
             status=status,
             person_id=person_id,
             confidence=confidence,
             track_id=track_id,
-            snapshot=snapshot,
+            frame_jpeg=frame_jpeg,
+            box=box,
+            kps=kps,
             evidence=evidence,
             aligned=aligned,
         )
@@ -58,26 +71,40 @@ class EventPublisher(threading.Thread):
             except Exception:
                 log.exception("failed to publish event")
 
-    def _save_snapshot(self, ts: datetime, img: np.ndarray) -> Optional[str]:
+    def _save_snapshot(self, item: dict) -> tuple[Optional[str], tuple[int, int], tuple[int, int]]:
+        """Crop of the frame around the face. Returns (path, crop offset, crop size)."""
+        frame = Image.open(io.BytesIO(item["frame_jpeg"]))
+        w, h = frame.size
+        x1, y1, x2, y2 = item["box"]
+        mx, my = (x2 - x1) * SNAPSHOT_MARGIN, (y2 - y1) * SNAPSHOT_MARGIN
+        a, b = max(int(x1 - mx), 0), max(int(y1 - my), 0)
+        c, d = min(int(x2 + mx), w), min(int(y2 + my), h)
+        crop = frame.crop((a, b, c, d)).convert("RGB")
+        ts = item["ts"]
         rel = f"snapshots/{ts:%Y/%m/%d}/{ts:%H%M%S}_{uuid.uuid4().hex[:8]}.jpg"
         path = self._cfg.data_dir / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        ok = cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return rel if ok else None
+        crop.save(path, format="JPEG", quality=90)
+        return rel, (a, b), crop.size
 
-    def _save_aligned(self, snapshot_path: Optional[str], img: np.ndarray) -> Optional[str]:
+    def _save_aligned(self, snapshot_path: str, rgb: np.ndarray) -> str:
         """112x112 aligned face next to the snapshot (PNG: lossless, so explanations can be
         recomputed later from exactly what the recogniser saw)."""
-        if snapshot_path is None:
-            return None
         rel = snapshot_path.rsplit(".", 1)[0] + "_aligned.png"
-        return rel if cv2.imwrite(str(self._cfg.data_dir / rel), img) else None
+        (self._cfg.data_dir / rel).write_bytes(png_bytes(rgb))
+        return rel
 
     def _send(self, item: dict) -> None:
-        snapshot_path = self._save_snapshot(item["ts"], item["snapshot"])
+        snapshot_path, (ox, oy), crop_size = self._save_snapshot(item)
         evidence = item.get("evidence")
-        if evidence is not None and item.get("aligned") is not None:
-            evidence["aligned_path"] = self._save_aligned(snapshot_path, item["aligned"])
+        if evidence is not None:
+            # coordinates relative to the saved snapshot crop, so the UI can draw them on it
+            x1, y1, x2, y2 = item["box"]
+            evidence["crop_size"] = [int(crop_size[0]), int(crop_size[1])]
+            evidence["bbox"] = [float(x1 - ox), float(y1 - oy), float(x2 - ox), float(y2 - oy)]
+            evidence["kps"] = [[float(x - ox), float(y - oy)] for x, y in item["kps"]]
+            if item.get("aligned") is not None:
+                evidence["aligned_path"] = self._save_aligned(snapshot_path, item["aligned"])
         body = {
             "ts": item["ts"].isoformat(),
             "status": item["status"],

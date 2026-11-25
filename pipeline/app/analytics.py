@@ -10,30 +10,29 @@
             (pipeline/face_align), which reads SCRFD's landmarks from the same frame's metadata.
   identify  reads the 512-d embedding ArcFace produced, matches it in pgvector, decides
             known / unknown, labels the box and reports events.
+  clean     (on the branch that JPEG-encodes clean frames, before drawing) lets through only the
+            frames that are needed: a periodic snapshot and the frames of new events. The
+            event is sent with that JPEG and the aligned face the alignment library attached.
 """
 
-import ctypes
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import cv2
 import numpy as np
 import pyds
 
 from .config import Config
-from .dsmeta import add_object, iter_list as _iter, read_embedding, read_tensors
+from .dsmeta import add_object, iter_list as _iter, read_aligned_face, read_embedding, read_tensors
 from .events import EventPublisher
-from .geometry import aligned_crop, iou as _iou
+from .geometry import iou as _iou
 from .matcher import Matcher
 from .quality import assess
 from .scrfd import Face, decode
 
 log = logging.getLogger("analytics")
-_cudart = ctypes.CDLL("libcudart.so.12")
-ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+SNAPSHOT_EVERY = 10  # frames between clean snapshots for /snapshot.jpg
 
 GREEN, RED, AMBER = (0.1, 0.75, 0.3), (0.9, 0.2, 0.2), (0.95, 0.65, 0.1)
 
@@ -62,7 +61,9 @@ class Analytics:
         self.publisher = EventPublisher(cfg)
         self.explain_overlay = False
         self.frame_idx = 0
-        self.last_raw: Optional[np.ndarray] = None  # newest clean frame (BGR) for /snapshot.jpg
+        self.last_snapshot: Optional[bytes] = None  # newest clean frame, JPEG encoded on the GPU
+        self._wanted: set[int] = set()  # PTS of frames to JPEG-encode on the clean branch
+        self._pending: dict[int, list[dict]] = {}  # PTS -> events waiting for that frame's JPEG
         self._states: dict[tuple[int, int], TrackState] = {}
         self._faces: dict[tuple[int, int], list[Face]] = {}  # detections of the frame in flight
         self._aligned: dict[tuple[int, int], dict[int, Face]] = {}  # faces sent to ArcFace, per frame
@@ -72,6 +73,8 @@ class Analytics:
         self._states.clear()
         self._faces.clear()
         self._aligned.clear()
+        self._wanted.clear()
+        self._pending.clear()
 
     # ------------------------------------------------------------------ probe 1: detect
     def on_detect(self, pad, info, _user=None):
@@ -128,11 +131,8 @@ class Analytics:
         key = (fm.source_id, fm.frame_num)
         aligned = self._aligned.pop(key, {})
         objs = list(_iter(fm.obj_meta_list, pyds.NvDsObjectMeta.cast))
-        frame = None  # RGBA view of the clean frame, mapped lazily
-        # a clean copy for /snapshot.jpg every few frames
-        if self.frame_idx % 3 == 0:
-            frame = self._map(buf, fm)
-            self.last_raw = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        if self.frame_idx % SNAPSHOT_EVERY == 0:
+            self._wanted.add(buf.pts)  # a clean snapshot for /snapshot.jpg
 
         seen = set()
         for om in objs:
@@ -153,30 +153,12 @@ class Analytics:
             if emb is not None and self.frame_idx - st.last_attempt >= self._interval(st):
                 self._identify(st, emb)
             if st.status in ("known", "unknown") and st.hits >= cfg.min_hits:
-                if frame is None:
-                    frame = self._map(buf, fm)
-                self._maybe_emit(st, om.object_id, face, frame)
+                self._maybe_emit(st, om, face, buf.pts)
             self._decorate(bm, fm, om, st, face)
 
         stale = [k for k, s in self._states.items() if self.frame_idx - s.last_seen > 90]
         for k in stale:
             del self._states[k]
-
-    @staticmethod
-    def _map(buf, fm) -> np.ndarray:
-        """Copy of the RGBA frame in host memory. The pixels stay on the GPU; only the region
-        we ask for is copied, with an explicit cudaMemcpy2D (safe next to running kernels)."""
-        _, shape, strides, ptr, _ = pyds.get_nvds_buf_surface_gpu(hash(buf), fm.batch_id)
-        h, w, c = shape
-        out = np.empty((h, w, c), np.uint8)
-        err = _cudart.cudaMemcpy2D(
-            ctypes.c_void_p(out.ctypes.data), ctypes.c_size_t(w * c),
-            ctypes.c_void_p(ctypes.pythonapi.PyCapsule_GetPointer(ptr, None)), ctypes.c_size_t(strides[0]),
-            ctypes.c_size_t(w * c), ctypes.c_size_t(h), ctypes.c_int(4),  # 4 = cudaMemcpyDefault
-        )
-        if err != 0:
-            raise RuntimeError(f"cudaMemcpy2D failed with code {err}")
-        return out
 
     # ------------------------------------------------------------------ decisions
     def _interval(self, st: TrackState) -> int:
@@ -200,48 +182,45 @@ class Analytics:
             if st.attempts >= cfg.unknown_after:
                 st.status, st.person_id, st.name = "unknown", None, None
 
-    def _maybe_emit(self, st: TrackState, track_id: int, face: Face, frame_rgba: np.ndarray) -> None:
+    def _maybe_emit(self, st: TrackState, om, face: Face, pts: int) -> None:
         now = time.time()
         changed = st.last_event_status != st.status
         if not changed and now - st.last_event_ts < self.cfg.event_cooldown:
             return
         st.last_event_ts, st.last_event_status = now, st.status
-        bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
-        crop, (ox, oy) = self._crop(bgr, face)
-        aligned = aligned_crop(bgr, face.kps)
+        aligned = read_aligned_face(om)  # the 112x112 face ArcFace saw, from the alignment library
         top = st.evidence_top
         evidence = {
             "version": 1,
             "model": self.cfg.model_id,
             "threshold": self.cfg.match_threshold,
             "det_score": float(face.score),
-            "crop_size": [int(crop.shape[1]), int(crop.shape[0])],
-            # coordinates are relative to the saved snapshot crop, so the UI can draw them on it
-            "bbox": [face.box[0] - ox, face.box[1] - oy, face.box[2] - ox, face.box[3] - oy],
-            "kps": [[float(x - ox), float(y - oy)] for x, y in face.kps],
-            "quality": assess(aligned, face.box, face.kps, face.score),
+            "quality": assess(aligned, face.box, face.kps, face.score) if aligned is not None else None,
             "top": top,
             "margin": round(top[0]["score"] - top[1]["score"], 4) if len(top) > 1 else None,
             "pipeline": "deepstream",
         }
-        self.publisher.submit(
-            status=st.status,
-            person_id=st.person_id,
-            confidence=st.score,
-            track_id=track_id,
-            snapshot=crop,
-            evidence=evidence,
-            aligned=aligned,
+        self._pending.setdefault(pts, []).append(
+            dict(status=st.status, person_id=st.person_id, confidence=st.score, track_id=om.object_id,
+                 box=face.box, kps=face.kps.copy(), evidence=evidence, aligned=aligned)
         )
+        self._wanted.add(pts)
 
-    @staticmethod
-    def _crop(frame: np.ndarray, face: Face, margin: float = 0.6) -> tuple[np.ndarray, tuple[int, int]]:
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = face.box
-        mx, my = (x2 - x1) * margin, (y2 - y1) * margin
-        a, b = max(int(x1 - mx), 0), max(int(y1 - my), 0)
-        c, d = min(int(x2 + mx), w), min(int(y2 + my), h)
-        return frame[b:d, a:c].copy(), (a, b)
+    # ------------------------------------------------------------------ clean frames
+    def clean_gate(self, pad, info, _user=None):
+        """Probe on the clean (not yet drawn) branch: only the frames somebody needs go on to
+        the JPEG encoder."""
+        return Gst_PAD_PROBE_OK if info.get_buffer().pts in self._wanted else Gst_PAD_PROBE_DROP
+
+    def on_clean_jpeg(self, pts: int, jpeg: bytes) -> None:
+        """A clean frame, JPEG-encoded on the GPU (nvjpegenc)."""
+        self._wanted.discard(pts)
+        self.last_snapshot = jpeg
+        for item in self._pending.pop(pts, []):
+            self.publisher.submit(frame_jpeg=jpeg, **item)
+        if len(self._pending) > 32:  # frames that never arrived (e.g. source switched)
+            for k in sorted(self._pending)[:-32]:
+                del self._pending[k]
 
     # ------------------------------------------------------------------ drawing
     def _decorate(self, bm, fm, om, st: TrackState, face: Face) -> None:
@@ -288,5 +267,6 @@ class Analytics:
         pyds.nvds_add_display_meta_to_frame(fm, dm)
 
 
-# Gst.PadProbeReturn.OK without importing Gst here (keeps this module testable)
+# Gst.PadProbeReturn values without importing Gst here (keeps this module testable)
+Gst_PAD_PROBE_DROP = 0
 Gst_PAD_PROBE_OK = 1

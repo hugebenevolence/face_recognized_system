@@ -81,3 +81,21 @@ def add_object(bm, fm, box, score: float = 1.0, label: str = "face", frame_size:
     om.detector_bbox_info.org_bbox_coords.height = box[3] - box[1]
     pyds.nvds_add_obj_meta_to_frame(fm, om, None)
     return om
+
+
+# User meta attached by the alignment library (pipeline/face_align) to every face it aligned:
+# {int32 width, int32 height, RGB bytes}, the exact 112x112 image ArcFace sees.
+_CHIP_TYPE = pyds.nvds_get_user_meta_type("TNI.FACE_ALIGN.CHIP")
+
+
+def read_aligned_face(om) -> Optional[np.ndarray]:
+    """The aligned face (H, W, 3 RGB uint8) the alignment library attached to an object, if any.
+    The meta is read through its C address, the same way pyds samples read tensor buffers."""
+    for um in iter_list(om.obj_user_meta_list, pyds.NvDsUserMeta.cast):
+        if um.base_meta.meta_type != _CHIP_TYPE:
+            continue
+        addr = pyds.get_ptr(um.user_meta_data)
+        w, h = (ctypes.c_int32 * 2).from_address(addr)
+        pixels = np.ctypeslib.as_array((ctypes.c_uint8 * (w * h * 3)).from_address(addr + 8))
+        return pixels.reshape(h, w, 3).copy()
+    return None

@@ -6,7 +6,6 @@ not calibrated on a dataset and the UI labels pose as an estimate.
 
 import math
 
-import cv2
 import numpy as np
 
 
@@ -14,9 +13,22 @@ def _check(key: str, label: str, value: str, status: str, hint: str) -> dict:
     return {"key": key, "label": label, "value": value, "status": status, "hint": hint}
 
 
+def _gray(rgb: np.ndarray) -> np.ndarray:
+    """ITU-R BT.601 luma, rounded to 8 bits."""
+    return np.rint(rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114).astype(np.float64)
+
+
+def _laplacian_var(gray: np.ndarray) -> float:
+    """Variance of the 4-neighbour Laplacian (mirrored borders): low means blurry."""
+    p = np.pad(gray, 1, mode="reflect")
+    lap = p[:-2, 1:-1] + p[2:, 1:-1] + p[1:-1, :-2] + p[1:-1, 2:] - 4 * p[1:-1, 1:-1]
+    return float(lap.var())
+
+
 def assess(aligned: np.ndarray, box, kps, det_score: float) -> dict:
-    gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
-    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())  # variance of Laplacian: low = blurry
+    """`aligned` is the 112x112 RGB face the recogniser sees."""
+    gray = _gray(aligned)
+    blur = _laplacian_var(gray)
     brightness = float(gray.mean())
     size = float(min(box[2] - box[0], box[3] - box[1]))
 

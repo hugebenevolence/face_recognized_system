@@ -1,6 +1,5 @@
 """Box and landmark geometry shared by the live and still-image graphs."""
 
-import cv2
 import numpy as np
 
 # ArcFace reference landmark positions inside the 112x112 face image:
@@ -41,13 +40,6 @@ def alignment_matrix(kps: np.ndarray, dst: np.ndarray = TEMPLATE) -> np.ndarray:
     scale = float((sv * d).sum() / var) if var > 0 else 1.0
     t = mu_d - scale * rot @ mu_s
     return np.hstack([scale * rot, t[:, None]])
-
-
-def aligned_crop(img_bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
-    """The aligned 112x112 face, as the alignment kernel produces it (used for previews,
-    quality checks and stored evidence)."""
-    m = alignment_matrix(kps).astype(np.float32)
-    return cv2.warpAffine(img_bgr, m, (112, 112), flags=cv2.INTER_LINEAR, borderValue=0)
 
 
 def face_extent(kps: np.ndarray) -> float:

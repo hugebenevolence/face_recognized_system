@@ -10,7 +10,10 @@
  *   2. fits the least-squares similarity transform (rotation, uniform scale, translation) from
  *      the landmarks onto the ArcFace 112x112 template, the transform insightface's norm_crop uses,
  *   3. warps the face out of the RGBA frame on the GPU with it (face_align_kernel.cu) and writes
- *      the normalised tensor that the ArcFace nvinfer (input-tensor-meta=1) reads.
+ *      the normalised tensor that the ArcFace nvinfer (input-tensor-meta=1) reads,
+ *   4. attaches the aligned face itself (112x112 RGB, the image ArcFace sees) to the object as a
+ *      user meta of type "TNI.FACE_ALIGN.CHIP" ({int32 width, int32 height, RGB bytes}), so the
+ *      application can keep it as evidence without touching the frame.
  * Objects of the "aligned face" class (already aligned 112x112 faces given to the still-image
  * graph) and faces without a matching detection are scaled from their box instead, like a
  * regular secondary nvinfer would do.
@@ -25,6 +28,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -66,6 +70,10 @@ struct CustomCtx {
   int out_w = 112, out_h = 112;
   float scale = 0.0078125f;
   float offset[3] = {127.5f, 127.5f, 127.5f};
+  unsigned char *chips_dev = nullptr;   // aligned faces of one batch, 8-bit RGB (device)
+  unsigned char *chips_host = nullptr;  // same, pinned host copy
+  int max_units = 0;
+  NvDsMetaType chip_type = NVDS_INVALID_META;
   unsigned detector_id = 1;
   float detector_threshold = 0.5f;
   int detector_size = 640;
@@ -168,6 +176,41 @@ static void box_inverse(const NvOSD_RectParams &r, int out_w, int out_h, float i
   inv[5] = r.top;
 }
 
+/* User meta holding one aligned face: {int32 width, int32 height, width*height*3 RGB bytes}. */
+static gpointer chip_copy(gpointer data, gpointer) {
+  auto *um = static_cast<NvDsUserMeta *>(data);
+  const int *hdr = static_cast<const int *>(um->user_meta_data);
+  size_t size = 2 * sizeof(int) + (size_t)hdr[0] * hdr[1] * 3;
+  void *copy = g_malloc(size);
+  std::memcpy(copy, um->user_meta_data, size);
+  return copy;
+}
+
+static void chip_release(gpointer data, gpointer) {
+  auto *um = static_cast<NvDsUserMeta *>(data);
+  g_free(um->user_meta_data);
+  um->user_meta_data = nullptr;
+}
+
+static void attach_chip(CustomCtx *ctx, NvDsObjectMeta *obj, const unsigned char *rgb) {
+  NvDsBatchMeta *bm = obj->base_meta.batch_meta;
+  if (bm == nullptr) return;
+  const size_t pixels = (size_t)ctx->out_w * ctx->out_h * 3;
+  int *hdr = static_cast<int *>(g_malloc(2 * sizeof(int) + pixels));
+  hdr[0] = ctx->out_w;
+  hdr[1] = ctx->out_h;
+  std::memcpy(hdr + 2, rgb, pixels);
+  nvds_acquire_meta_lock(bm);
+  NvDsUserMeta *um = nvds_acquire_user_meta_from_pool(bm);
+  um->user_meta_data = hdr;
+  um->base_meta.meta_type = ctx->chip_type;
+  um->base_meta.copy_func = chip_copy;
+  um->base_meta.release_func = chip_release;
+  um->base_meta.batch_meta = bm;
+  nvds_add_user_meta_to_obj(obj, um);
+  nvds_release_meta_lock(bm);
+}
+
 extern "C" {
 
 NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx, NvDsPreProcessBatch *batch,
@@ -178,6 +221,15 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx, NvDsPreProcessBatch
   float *out = static_cast<float *>(buf->memory_ptr);
   const size_t per_face = 3ul * ctx->out_w * ctx->out_h;
   std::unordered_map<const NvDsFrameMeta *, std::vector<Detection>> frames;  // decoded once per frame
+  const size_t chip_bytes = (size_t)ctx->out_w * ctx->out_h * 3;
+  if ((int)batch->units.size() > ctx->max_units) {  // grow the chip buffers when needed
+    cudaFree(ctx->chips_dev);
+    cudaFreeHost(ctx->chips_host);
+    ctx->max_units = (int)batch->units.size();
+    cudaMalloc(&ctx->chips_dev, chip_bytes * ctx->max_units);
+    cudaMallocHost(&ctx->chips_host, chip_bytes * ctx->max_units);
+  }
+  std::vector<NvDsObjectMeta *> chip_objs(batch->units.size(), nullptr);
 
   for (size_t i = 0; i < batch->units.size(); ++i) {
     const NvDsPreProcessUnit &u = batch->units[i];
@@ -205,8 +257,13 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx, NvDsPreProcessBatch
       std::printf("face_align: frame %d object %lu class %d %s\n", fm->frame_num,
                   (unsigned long)obj->object_id, obj->class_id, best ? "aligned on landmarks" : "scaled from box");
     fa_launch(static_cast<const unsigned char *>(s->dataPtr), (int)s->pitch, (int)s->width, (int)s->height,
-              inv, dst, ctx->out_w, ctx->out_h, ctx->scale, ctx->offset, ctx->stream);
+              inv, dst, ctx->chips_dev + i * chip_bytes, ctx->out_w, ctx->out_h, ctx->scale, ctx->offset,
+              ctx->stream);
+    chip_objs[i] = const_cast<NvDsObjectMeta *>(obj);
   }
+  if (!batch->units.empty())
+    cudaMemcpyAsync(ctx->chips_host, ctx->chips_dev, chip_bytes * batch->units.size(), cudaMemcpyDeviceToHost,
+                    ctx->stream);
   cudaError_t err = cudaStreamSynchronize(ctx->stream);
   if (err == cudaSuccess) err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -214,6 +271,8 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx, NvDsPreProcessBatch
     acquirer->release(buf);
     return NVDSPREPROCESS_CUSTOM_TENSOR_FAILED;
   }
+  for (size_t i = 0; i < chip_objs.size(); ++i)
+    if (chip_objs[i] != nullptr) attach_chip(ctx, chip_objs[i], ctx->chips_host + i * chip_bytes);
   tensorParam.params.network_input_shape[0] = (int)batch->units.size();
   return NVDSPREPROCESS_SUCCESS;
 }
@@ -251,6 +310,7 @@ CustomCtx *initLib(CustomInitParams initparams) {
   if (!uc["detector-input-size"].empty()) ctx->detector_size = std::stoi(uc["detector-input-size"]);
   if (!uc["aligned-class-id"].empty()) ctx->aligned_class = std::stoi(uc["aligned-class-id"]);
   if (cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking) != cudaSuccess) return nullptr;
+  ctx->chip_type = nvds_get_user_meta_type(const_cast<gchar *>("TNI.FACE_ALIGN.CHIP"));
   std::printf("face_align: ready, output %dx%d, landmarks from nvinfer unique-id %u\n", ctx->out_w,
               ctx->out_h, ctx->detector_id);
   return ctx.release();
@@ -259,6 +319,8 @@ CustomCtx *initLib(CustomInitParams initparams) {
 void deInitLib(CustomCtx *ctx) {
   if (ctx == nullptr) return;
   if (ctx->stream) cudaStreamDestroy(ctx->stream);
+  cudaFree(ctx->chips_dev);
+  cudaFreeHost(ctx->chips_host);
   delete ctx;
 }
 

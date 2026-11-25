@@ -14,8 +14,10 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
-import cv2
+import io
+
 import numpy as np
+from PIL import Image
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
@@ -23,6 +25,7 @@ from pydantic import BaseModel
 from .config import cfg
 from .engine import FaceEngine
 from .explain import explain
+from .picture import Picture
 from .runner import Runner, SourceSpec
 from .sources import list_file_sources, public_uri, validate_uri
 from .still_graph import GraphNotReady, StillGraph
@@ -171,11 +174,24 @@ async def _not_ready(_request, exc: GraphNotReady):
     return JSONResponse({"detail": str(exc)}, status_code=503)
 
 
-def _decode(file: UploadFile) -> np.ndarray:
-    img = cv2.imdecode(np.frombuffer(file.file.read(), np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(422, "Not a valid image")
-    return img
+def _picture(file: UploadFile) -> Picture:
+    """An upload as a Picture: a plain JPEG stays compressed and is decoded by the graph on the
+    GPU; other formats are decoded here."""
+    try:
+        return Picture.from_bytes(file.file.read())
+    except ValueError:
+        raise HTTPException(422, "Not a valid image") from None
+
+
+def _rgb(file: UploadFile, size: Optional[tuple[int, int]] = None) -> np.ndarray:
+    """A small stored image (aligned face, event crop) as an RGB array."""
+    try:
+        img = Image.open(io.BytesIO(file.file.read())).convert("RGB")
+    except Exception:
+        raise HTTPException(422, "Not a valid image") from None
+    if size is not None and img.size != size:
+        img = img.resize(size, Image.Resampling.BOX)
+    return np.asarray(img)
 
 
 def _parse_box(box: Optional[str]) -> Optional[tuple]:
@@ -201,9 +217,9 @@ def _similar(emb: np.ndarray) -> list[dict]:
 def embed(file: UploadFile = File(...), box: Optional[str] = Form(None)):
     """Embedding of one face in an uploaded image: the one inside `box` if given, otherwise
     the largest. Also returns the evidence stored with the registration."""
-    img = _decode(file)
+    pic = _picture(file)
     b = _parse_box(box)
-    dets = find_faces(engine, img, b)
+    dets = find_faces(engine, pic, b)
     if not dets:
         raise HTTPException(422, "No face found in the selected area" if b else "No face detected")
     best = max(dets, key=lambda d: d.area)
@@ -211,15 +227,14 @@ def embed(file: UploadFile = File(...), box: Optional[str] = Form(None)):
         raise HTTPException(422, f"Detection confidence is too low at {best.score:.2f}")
     if best.size < 60:
         raise HTTPException(422, "Face is too small. It needs at least 60 px")
-    aligned = engine.align(img, best)
-    emb = engine.embed(img, best)
-    info = describe(engine, img, best, aligned)
+    emb = engine.embed(pic, best)  # also keeps the aligned face the graph produced
+    info = describe(engine, pic, best)
     return {
         "model": engine.pack,
         "embedding": emb.tolist(),
         "det_score": best.score,
         "face_count": len(dets),
-        "image_size": [int(img.shape[1]), int(img.shape[0])],
+        "image_size": [pic.width, pic.height],
         "bbox": info["box"],
         "pipeline": "deepstream",
         **info,
@@ -230,20 +245,20 @@ def embed(file: UploadFile = File(...), box: Optional[str] = Form(None)):
 def analyze(file: UploadFile = File(...), box: Optional[str] = Form(None)):
     """All faces in an image (for the group-photo picker), or only the one inside `box`,
     in which case it also reports which registered people it resembles."""
-    img = _decode(file)
+    pic = _picture(file)
     b = _parse_box(box)
-    dets = find_faces(engine, img, b)
+    dets = find_faces(engine, pic, b)
     if b is not None and not dets:
         raise HTTPException(422, "No face found in the selected area")
     faces = []
     for i, d in enumerate(dets[:MAX_FACES]):
-        f = describe(engine, img, d)
+        f = describe(engine, pic, d)
         f["index"] = i
         faces.append(f)
     if b is not None:
-        faces[0]["similar"] = _similar(engine.embed(img, dets[0]))
+        faces[0]["similar"] = _similar(engine.embed(pic, dets[0]))
     return {
-        "image": {"width": int(img.shape[1]), "height": int(img.shape[0])},
+        "image": {"width": pic.width, "height": pic.height},
         "model": engine.pack,
         "faces": faces,
         "truncated": len(dets) > MAX_FACES,
@@ -254,18 +269,18 @@ def analyze(file: UploadFile = File(...), box: Optional[str] = Form(None)):
 def probe(file: UploadFile = File(...)):
     """Cheap per-frame check used while capturing from a camera: is there exactly one
     usable face and how is it posed? (detection only, no embedding)"""
-    img = _decode(file)
-    dets = engine.detect(img)
+    pic = _picture(file)
+    dets = engine.detect(pic)
     if not dets:
         return {"faces": 0}
     best = max(dets, key=lambda d: d.area)
-    d = describe(engine, img, best, engine.align(img, best))
+    d = describe(engine, pic, best)  # aligned face from the detection view: no extra pass
     return {
         "faces": len(dets),
         "box": d["box"],
         "score": d["score"],
         "quality": d["quality"],
-        "image_size": [int(img.shape[1]), int(img.shape[0])],
+        "image_size": [pic.width, pic.height],
     }
 
 
@@ -276,15 +291,15 @@ def compare(files: list[UploadFile] = File(...)):
     embs: list[Optional[np.ndarray]] = []
     items: list[dict] = []
     for f in files[:12]:
-        img = _decode(f)
-        dets = find_faces(engine, img, None)
+        pic = _picture(f)
+        dets = find_faces(engine, pic, None)
         if not dets:
             embs.append(None)
             items.append({"ok": False})
             continue
         best = max(dets, key=lambda d: d.area)
-        embs.append(engine.embed(img, best))
-        q = describe(engine, img, best, engine.align(img, best))["quality"]
+        embs.append(engine.embed(pic, best))
+        q = describe(engine, pic, best)["quality"]
         items.append(
             {"ok": True, "yaw_ratio": q["metrics"]["yaw_ratio"], "quality": q["overall"], "faces": len(dets)}
         )
@@ -311,12 +326,10 @@ def explain_face(
             f"This event was recorded with model {p['model']} but the system now runs {engine.pack} "
             "so it cannot be explained",
         )
-    a = _decode(aligned)
-    if a.shape[:2] != (112, 112):
-        a = cv2.resize(a, (112, 112), interpolation=cv2.INTER_AREA)
+    a = _rgb(aligned, (112, 112))
     refs = np.asarray(p.get("refs") or [], dtype=np.float32).reshape(-1, 512)
     refs = refs / (np.linalg.norm(refs, axis=1, keepdims=True) + 1e-9) if len(refs) else refs
-    c = _decode(crop) if crop is not None else None
+    c = _rgb(crop) if crop is not None else None
     if c is not None and not (p.get("bbox") and p.get("kps")):
         c = None
     return explain(engine, a, c, p.get("bbox"), p.get("kps"), refs)
