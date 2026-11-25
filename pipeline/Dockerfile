@@ -4,8 +4,8 @@ ARG DS_IMAGE=nvcr.io/nvidia/deepstream:7.1-samples-multiarch
 
 # Build stage (the compilers stay here, only two .so files go into the runtime image):
 #  - libface_align.so: face alignment for nvdspreprocess (CUDA kernel + DeepStream glue)
-#  - gst-nvinfer rebuilt from NVIDIA's shipped source with one fix (patches/), so that ArcFace's
-#    output tensor can be read from objects when its input comes from nvdspreprocess
+#  - gst-nvinfer rebuilt from NVIDIA's shipped source with a small change (patches/) so that
+#    ArcFace's output tensor is attached to each face object when its input comes from nvdspreprocess
 FROM ${DS_IMAGE} AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cuda-nvcc-12-6 cuda-cudart-dev-12-6 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
