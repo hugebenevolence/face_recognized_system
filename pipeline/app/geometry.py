@@ -1,4 +1,4 @@
-"""Box and landmark geometry shared by the live probes and the still-image service."""
+"""Box and landmark geometry shared by the live and still-image graphs."""
 
 import cv2
 import numpy as np
@@ -9,8 +9,6 @@ TEMPLATE = np.array(
     [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
     dtype=np.float64,
 )
-_TEMPLATE_MEAN = TEMPLATE.mean(axis=0)
-_TEMPLATE_NORM = float(np.sqrt(((TEMPLATE - _TEMPLATE_MEAN) ** 2).sum()))
 
 
 def iou(a, b) -> float:
@@ -28,24 +26,31 @@ def containment(a, b) -> float:
     return inter / small if small > 0 else 0.0
 
 
-def face_transform(kps: np.ndarray) -> tuple[float, np.ndarray]:
-    """Scale + translation that maps the five landmarks onto the ArcFace template.
-    Rotation is left out on purpose: nvinfer can only crop axis-aligned regions, and for
-    upright faces the result is within ~1% cosine of a full alignment (checked offline)."""
-    mean = kps.mean(axis=0)
-    spread = float(np.sqrt(((kps - mean) ** 2).sum())) or 1e-6
-    s = _TEMPLATE_NORM / spread
-    return s, _TEMPLATE_MEAN - s * mean
+def alignment_matrix(kps: np.ndarray, dst: np.ndarray = TEMPLATE) -> np.ndarray:
+    """Face alignment: the 2x3 similarity transform (rotation, uniform scale, translation) that
+    maps the five detected landmarks onto the ArcFace template, by least squares (Umeyama).
+    This is the transform insightface's norm_crop uses."""
+    src = np.asarray(kps, dtype=np.float64).reshape(-1, 2)
+    mu_s, mu_d = src.mean(axis=0), dst.mean(axis=0)
+    sc, dc = src - mu_s, dst - mu_d
+    cov = dc.T @ sc / len(src)
+    u, sv, vt = np.linalg.svd(cov)
+    d = np.array([1.0, -1.0 if np.linalg.det(u) * np.linalg.det(vt) < 0 else 1.0])
+    rot = u @ np.diag(d) @ vt
+    var = (sc**2).sum() / len(src)
+    scale = float((sv * d).sum() / var) if var > 0 else 1.0
+    t = mu_d - scale * rot @ mu_s
+    return np.hstack([scale * rot, t[:, None]])
 
 
-def roi_of(kps: np.ndarray) -> tuple[float, float, float]:
-    """(left, top, side) of the frame region that becomes the 112x112 ArcFace input."""
-    s, t = face_transform(kps)
-    return float(-t[0] / s), float(-t[1] / s), 112.0 / s
+def aligned_crop(img_bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
+    """The aligned 112x112 face, as the alignment kernel produces it (used for previews,
+    quality checks and stored evidence)."""
+    m = alignment_matrix(kps).astype(np.float32)
+    return cv2.warpAffine(img_bgr, m, (112, 112), flags=cv2.INTER_LINEAR, borderValue=0)
 
 
-def aligned_crop(frame_bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
-    """The 112x112 face exactly as ArcFace sees it."""
-    s, t = face_transform(kps)
-    m = np.array([[s, 0, t[0]], [0, s, t[1]]], dtype=np.float32)
-    return cv2.warpAffine(frame_bgr, m, (112, 112), flags=cv2.INTER_LINEAR)
+def face_extent(kps: np.ndarray) -> float:
+    """Side, in image pixels, of the region that becomes the 112x112 aligned face."""
+    m = alignment_matrix(kps)
+    return 112.0 / float(np.hypot(m[0, 0], m[1, 0]))

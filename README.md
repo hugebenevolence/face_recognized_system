@@ -16,20 +16,21 @@ Register faces in a web UI, watch a live video stream with recognised names draw
 
 ## The video pipeline
 
-Detection, tracking, recognition, drawing and encoding all run **inside one DeepStream (GStreamer) graph**, on the GPU:
+Detection, tracking, face alignment, recognition, drawing and encoding all run **inside one DeepStream (GStreamer) graph**, on the GPU:
 
 ```
-source ──► nvstreammux ──► nvinfer SCRFD ──► nvtracker ──► nvinfer ArcFace ──► nvdsosd ──► nvjpegenc ──► MJPEG to the browser
-(RTSP,      batches        face boxes +      stable ids    512-d embedding     draws boxes     (optional: nvv4l2h264enc
- file,      frames         5 landmarks       per face      per tracked face    and labels       ──► rtspclientsink)
+source ──► nvstreammux ──► nvinfer SCRFD ──► nvtracker ──► nvdspreprocess ──► nvinfer ArcFace ──► nvdsosd ──► nvjpegenc ──► MJPEG
+(RTSP,      batches        face boxes +      stable ids    face alignment     512-d embedding     draws boxes     (optional: nvv4l2h264enc
+ file,      frames         5 landmarks       per face      (CUDA warp)        per face            and labels       ──► rtspclientsink)
  browser)
-                                 probe 1: decode        probe 2: ROI        probe 3: match in pgvector,
-                                 SCRFD tensors          from landmarks      label, post events
+                       probe 1: decode    probe 2: alignment matrix                   probe 3: match in pgvector,
+                       SCRFD tensors      from the landmarks                          label, post events
 ```
 
-* **SCRFD** (face detector) and **ArcFace** (`w600k_r50`, 512-d embedding) run as `nvinfer` elements on TensorRT (FP16). The engines are built on first start and cached in the `models` volume.
-* **`nvtracker`** gives each face a stable id, so the embedding is computed once per few frames per person and each appearance produces one event.
-* Three small **pad probes** (`pipeline/app/analytics.py`) handle the metadata: decode SCRFD's raw tensors into boxes and landmarks, point the ArcFace region at the face (computed from the landmarks), then read the embedding, match it with pgvector and label the box. Matching and event delivery stay in Python because they talk to PostgreSQL and the backend.
+* **SCRFD** (face detector, box + 5 landmarks) and **ArcFace** (`w600k_r50`, 512-d embedding) run as `nvinfer` elements on TensorRT (FP16). The engines are built on first start and cached in the `models` volume.
+* **`nvtracker`** gives each face a stable id, so each appearance produces one event and the database is not queried on every frame.
+* **Face alignment** happens in the graph, the way ArcFace was trained: the five landmarks give a similarity transform (rotation, scale, translation) onto the ArcFace template, and `nvdspreprocess` with a small CUDA library (`pipeline/face_align`) warps each face out of the GPU frame with it and writes ArcFace's input tensor directly. Faces with a tilted head stay recognisable (see *How recognition works*).
+* Three small **pad probes** (`pipeline/app/analytics.py`) handle the metadata: decode SCRFD's raw tensors into boxes and landmarks, compute each face's alignment matrix and store it in the object's user fields (`misc_obj_info`), then read the embedding, match it with pgvector and label the box. Matching and event delivery stay in Python because they talk to PostgreSQL and the backend.
 * Video reaches the browser as MJPEG through the backend (`/api/stream.mjpg`). Set `RTSP_OUT_URL` to also publish the annotated stream as H.264 over RTSP.
 
 ### Registration uses the same pipeline
@@ -37,12 +38,12 @@ source ──► nvstreammux ──► nvinfer SCRFD ──► nvtracker ──�
 Photos (registration, group photos, camera captures) and the explanation maps go through a second, small DeepStream graph that lives in the same container and shares the two models:
 
 ```
-photo ──► view (640x640) ──► nvstreammux ──► nvinfer SCRFD ──► nvinfer ArcFace ──► embedding
-          tiles for big      batch of 1       finds faces        runs on the face    stored in pgvector
-          group photos                        (detect request)   region (embed request)
+photo ──► view (640x640) ──► nvstreammux ──► nvinfer SCRFD ──► nvdspreprocess ──► nvinfer ArcFace ──► embedding
+          tiles for big      batch of 1       finds faces        face alignment     same engine        stored in pgvector
+          group photos                        (or given faces)   same library       as live
 ```
 
-A face registered from a photo is therefore embedded by the same `nvinfer` elements and the same landmark crop as the same face on camera (`pipeline/app/still_graph.py`, `engine.py`). Large photos are cut into overlapping tiles so small faces keep their pixels. The occlusion maps pack many masked 112x112 faces into one view (a mosaic) and ArcFace embeds all of them in one pass.
+It is the live chain without the tracker (`pipeline/app/still_graph.py`, `engine.py`), so a face registered from a photo is detected, aligned and embedded by exactly the same code as the same face on camera. Large photos are cut into overlapping tiles so small faces keep their pixels. For the explanation maps, many masked, already aligned 112x112 faces are laid out as a mosaic in one view; their landmarks are the template itself, so the alignment step copies them unchanged and ArcFace embeds all of them in one pass.
 
 ## Quick start
 
@@ -92,10 +93,21 @@ Set `SOURCE_URI` in `.env` (copy `.env.example`) for the default source at start
 
 - **Detection**: SCRFD. **Embedding**: ArcFace (512-d, L2-normalised). Both come from insightface's `buffalo_l` pack, converted to TensorRT by `nvinfer`.
 - **Matching**: cosine similarity via pgvector (`<=>` operator, HNSW index). A face is *known* if similarity ≥ `MATCH_THRESHOLD` (default 0.40), otherwise *Unknown*.
-- **Tracking**: `nvtracker` (IOU) gives each face a stable ID. The probe lets a face through to ArcFace every `ID_INTERVAL` frames (5) while it is unresolved and every `REID_INTERVAL` frames (45) once known. Each appearance produces **one** event (re-logged after `EVENT_COOLDOWN` seconds if the person stays in view, or immediately if their status changes).
+- **Alignment**: a least-squares similarity transform (Umeyama, as in insightface's `norm_crop`) from the 5 landmarks onto the 112x112 ArcFace template, applied by the CUDA kernel in `nvdspreprocess`. The kernel matches an OpenCV `warpAffine` of the same face to a cosine similarity of 0.9998.
+- **Tracking**: `nvtracker` (IOU) gives each face a stable ID. ArcFace embeds every tracked face on every frame; the database is queried for a face every `ID_INTERVAL` frames (5) while it is unresolved and every `REID_INTERVAL` frames (45) once known. Each appearance produces **one** event (re-logged after `EVENT_COOLDOWN` seconds if the person stays in view, or immediately if their status changes).
 - **Events** are posted by the pipeline to the backend, which stores them in PostgreSQL (timestamp, person or Unknown, confidence, camera, snapshot path, evidence) and pushes them to browsers over `WS /ws/events`.
 - Snapshots and registered images are stored on the `appdata` volume and served at `/files/...`.
-- **Registration and live video use the same pipeline.** Photos are embedded by the still-image graph, live faces by the live graph. Both use the same ArcFace engine and the same landmark crop, so the vectors are directly comparable. As a check, 6 faces of a test video were found in one still frame and every stored registration photo re-embedded through the graph matched its stored vector with cosine similarity 0.88 to 0.99 (most above 0.97; the stored vectors came from an earlier ONNX Runtime version with full alignment).
+- **Registration and live video use the same pipeline.** Photos are embedded by the still-image graph, live faces by the live graph, with the same alignment library and the same ArcFace engine, so the vectors are directly comparable.
+- **Why alignment matters** (24 faces from a test video, each rotated in the image plane and compared with the same face upright, through the same TensorRT engine; recognition threshold 0.40):
+
+  | Head tilt | Crop without rotation (previous version) | Full alignment (now) |
+  |---|---|---|
+  | 10° | 0.82 | 0.99 |
+  | 20° | 0.56 | 0.98 |
+  | 30° | 0.38 (below the threshold) | 0.97 |
+  | 45° | 0.17 | 0.81 |
+
+- **Embedding spaces.** Every stored vector carries the id of what produced it (`MODEL_ID`, now `buffalo_l-aligned`) and is only compared with vectors of the same id. After a change of model or alignment, `POST /api/admin/reanalyze` re-embeds every stored registration photo under the new id and keeps the old vectors.
 
 ## API
 
@@ -156,9 +168,9 @@ angles can only help recall; poor frames can hurt, which is why every shot is qu
 
 ## Performance
 
-Measured on a laptop with an RTX 3050 (4 GB), 1280x720 input, one face in view, Docker Desktop on WSL2: the whole graph
-(decode, SCRFD, tracker, ArcFace, drawing, JPEG encode) ran at about 105 frames per second with an unpaced file source, so real-time
-sources (25 to 30 fps) have plenty of headroom. The first start builds the TensorRT engines (about 4 minutes for both models);
+Measured on a laptop with an RTX 3050 (4 GB), 1280x720 input, six faces in view, Docker Desktop on WSL2: the whole graph
+(decode, SCRFD, tracker, alignment and ArcFace for every face on every frame, drawing, JPEG encode) ran at about 55 frames per second
+with an unpaced file source, about twice the rate of a real camera (25 to 30 fps). The first start builds the TensorRT engines (about 4 minutes for both models);
 later starts load them from the cache in about 2 seconds.
 
 ## Configuration
@@ -169,8 +181,10 @@ All optional; see `.env.example`. Tuning knobs for the pipeline (`MATCH_THRESHOL
 
 - **Why DeepStream.** Inference, tracking and drawing are elements of the GStreamer graph and run on the GPU without leaving it, instead of pulling frames into application code. The cost is an NVIDIA-only, roughly 20 GB base image.
 - **SCRFD output is decoded in a pad probe.** `nvinfer` runs the network, but its stock parser interface cannot return the five landmarks, so the raw tensors are decoded in Python (`app/scrfd.py`). A C++ parser would be faster but is not needed at this scale.
-- **Alignment without rotation.** `nvinfer` can only crop axis-aligned regions, so the ArcFace input is a landmark-derived crop (scale and position corrected, rotation not). On the registered test photos this scored within about 1% of full alignment for upright faces, and clearly better than a plain box crop (about 0.74 against 0.48 same-person similarity). Strongly tilted heads lose some accuracy.
-- The ArcFace region must lie fully inside the frame, so a face cut by the image border keeps its previous identity but is not re-embedded.
+- **Alignment in `nvdspreprocess`.** `nvinfer` can only crop axis-aligned rectangles, which cannot undo a tilted head. The alignment therefore runs in `nvdspreprocess`, DeepStream's element for custom input preparation, with a custom library. Pixels outside the frame are filled with black, as in insightface's `norm_crop`, so a face at the image border is still embedded.
+- **One fix to NVIDIA's `gst-nvinfer`.** With its input coming from `nvdspreprocess` and `output-tensor-meta=1`, DeepStream 7.1's `nvinfer` adds the same metadata to both the frame and the object, so it is freed twice and the process crashes. NVIDIA ships the plugin's source for this kind of change; the Dockerfile rebuilds it with a small patch (`pipeline/patches/`) that attaches ArcFace's output to the object only.
+- **pyds and `misc_obj_info`.** The field is `gint64[4]` in `nvdsmeta.h`, but pyds 1.2 exposes it as `int32[4]`, so the alignment matrix is written through the field's address (`app/dsmeta.py`).
+- Turning the head sideways (out of the image plane) is not corrected by any 2D alignment; register a few angles (the guided camera capture does this).
 - RTSP cameras must send H.264. Single camera per pipeline container.
 - Tables are created at backend start-up (`create_all`) plus a few idempotent `ALTER TABLE ... IF NOT EXISTS` for columns added later; there is no migration tool yet.
 - No authentication on the API; it is meant for a trusted network. The pipeline to backend channel uses a shared secret (`INTERNAL_TOKEN`).
@@ -179,7 +193,10 @@ All optional; see `.env.example`. Tuning knobs for the pipeline (`MATCH_THRESHOL
 
 ```
 backend/    FastAPI app (models, routers, WebSocket, client for the pipeline service)
-pipeline/   DeepStream: live graph (runner.py, analytics.py), still-image graph (still_graph.py, engine.py, stills.py, explain.py), SCRFD decoder, nvinfer/tracker configs
+pipeline/   DeepStream: live graph (runner.py, analytics.py), still-image graph (still_graph.py, engine.py, stills.py, explain.py),
+            SCRFD decoder, configs for nvinfer / nvtracker / nvdspreprocess, face_align/ (CUDA alignment library),
+            patches/ (gst-nvinfer fix)
+docs/graphs/ the real GStreamer graphs of both pipelines, exported from the running service
 frontend/   Next.js UI (live, faces, history)
 samples/    put demo.mp4 here
 ```

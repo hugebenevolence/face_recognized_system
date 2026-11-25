@@ -1,0 +1,47 @@
+# nvdspreprocess in front of the ArcFace nvinfer: face alignment.
+# For every face object it warps the face out of the RGBA frame with the 2x3 similarity transform
+# the pipeline computed from SCRFD's five landmarks (rotation, scale, translation onto the ArcFace
+# template), and writes the normalised 3x112x112 tensor that ArcFace reads. The warp runs as a CUDA
+# kernel in libface_align.so (pipeline/face_align), on the GPU frame.
+[property]
+enable=1
+# the ArcFace nvinfer (gie-unique-id=2) consumes these tensors
+target-unique-ids=2
+operate-on-gie-id=1
+process-on-frame=0
+unique-id=5
+gpu-id=0
+maintain-aspect-ratio=0
+symmetric-padding=0
+# the plugin's own per-object scaling (unused by the tensor, kept small)
+processing-width=112
+processing-height=112
+scaling-buf-pool-size=8
+tensor-buf-pool-size=8
+# NCHW, batch of 4 faces (the ArcFace TensorRT engine is built for batch 1 to 4)
+network-input-order=0
+network-input-shape=4;3;112;112
+# RGB, float32, ArcFace's input layer name
+network-color-format=0
+tensor-data-type=0
+tensor-name=input.1
+scaling-pool-memory-type=0
+scaling-pool-compute-hw=1
+scaling-filter=0
+custom-lib-path=/opt/face_align/libface_align.so
+custom-tensor-preparation-function=CustomTensorPreparation
+
+[user-configs]
+# ArcFace normalisation: (pixel - 127.5) / 128
+pixel-normalization-factor=0.0078125
+offsets=127.5;127.5;127.5
+
+[group-0]
+src-ids=-1
+process-on-all-objects=1
+operate-on-class-ids=0
+custom-input-transformation-function=CustomAsyncTransformation
+input-object-min-width=24
+input-object-min-height=24
+# frames skipped between two alignment + embedding passes (0 = every frame)
+interval=0

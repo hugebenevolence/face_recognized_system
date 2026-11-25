@@ -1,7 +1,9 @@
 """Face detection and embedding for still images, on the DeepStream still-image graph.
 
-The graph (still_graph.py) takes 640x640 views. This module turns an arbitrary photo into views,
-merges what the detector finds, and builds the single-face view used to embed a face.
+The graph (still_graph.py) takes 640x640 views and runs SCRFD, the alignment library and ArcFace
+on them, like the live graph does on video frames. This module turns an arbitrary photo into
+views: the whole photo (and overlapping tiles of big photos) to find faces, and one view per face
+to embed it.
 """
 
 from dataclasses import dataclass
@@ -10,15 +12,16 @@ import cv2
 import numpy as np
 
 from .config import Config
-from .geometry import aligned_crop, containment, iou, roi_of
+from .geometry import TEMPLATE, aligned_crop, containment, face_extent, iou
+from .scrfd import Face
 from .still_graph import VIEW, StillGraph
 
 TILE_STRIDE = 480  # tiles overlap by 160 px so a face is whole in at least one of them
 BIG_IMAGE = 800  # below this the whole-image view is enough
 TILE_LONG_SIDE = 1280  # tiles cut the image at this size: small faces keep their pixels
 MIN_FACE_PX = 24  # in original image pixels
-ROI_PX = 224  # side of the ArcFace region in the single-face view (nvinfer scales it to 112)
-MOSAIC = VIEW // 112  # 112x112 faces per row of a mosaic view
+MAX_ALIGN_PX = 224  # a bigger face is shrunk (area averaging) so its aligned region is this wide
+MOSAIC = VIEW // 112  # aligned 112x112 faces per row of a mosaic view
 
 
 @dataclass
@@ -54,10 +57,16 @@ def _positions(extent: int) -> list[int]:
     return pos
 
 
+def _map_face(f: Face, scale: float, dx: float = 0.0, dy: float = 0.0) -> Detection:
+    """A face found in a view, back in original image pixels."""
+    box = (f.box[0] + dx, f.box[1] + dy, f.box[2] + dx, f.box[3] + dy)
+    return Detection(tuple(float(v / scale) for v in box), (f.kps + (dx, dy)) / scale, f.score)
+
+
 class FaceEngine:
     def __init__(self, cfg: Config, graph: StillGraph) -> None:
         self._graph = graph
-        self.pack = cfg.model_pack
+        self.pack = cfg.model_id  # embedding space id, see Config.model_id
 
     @property
     def ready(self) -> bool:
@@ -71,10 +80,7 @@ class FaceEngine:
         view = _canvas()
         small = _resize(img_bgr, scale)
         view[: small.shape[0], : small.shape[1]] = small
-        return [
-            Detection(tuple(float(v / scale) for v in f.box), f.kps / scale, f.score)
-            for f in self._graph.detect(view)
-        ]
+        return [_map_face(s.face, scale) for s in self._graph.detect(view)]
 
     def detect_multiscale(self, img_bgr: np.ndarray) -> list[Detection]:
         """The whole-image view, plus overlapping tiles of a 1280 px version for big images
@@ -90,13 +96,9 @@ class FaceEngine:
                     tile = work[ty : ty + VIEW, tx : tx + VIEW]
                     view = _canvas()
                     view[: tile.shape[0], : tile.shape[1]] = tile
-                    for f in self._graph.detect(view):
-                        if self._cut_by_tile(f.box, tx, ty, tile.shape[1], tile.shape[0], ww, wh):
-                            continue
-                        box = (f.box[0] + tx, f.box[1] + ty, f.box[2] + tx, f.box[3] + ty)
-                        found.append(
-                            Detection(tuple(float(v / s) for v in box), (f.kps + (tx, ty)) / s, f.score)
-                        )
+                    for st in self._graph.detect(view):
+                        if not self._cut_by_tile(st.face.box, tx, ty, tile.shape[1], tile.shape[0], ww, wh):
+                            found.append(_map_face(st.face, s, tx, ty))
         found = [d for d in found if d.size >= MIN_FACE_PX]
         kept: list[Detection] = []
         for d in sorted(found, key=lambda d: -d.score):
@@ -121,18 +123,17 @@ class FaceEngine:
         return aligned_crop(img_bgr, det.kps)
 
     def embed(self, img_bgr: np.ndarray, det: Detection) -> np.ndarray:
-        """Embedding of one face: a view with the region ArcFace needs placed at a fixed spot,
-        so the secondary nvinfer crops and scales it exactly as it does in the live graph."""
-        left, top, side = roi_of(det.kps)
-        f = min(1.0, 2.0 * ROI_PX / side)  # pre-shrink huge photos with area averaging
-        if f < 1.0:
-            img_bgr = _resize(img_bgr, f)
-            left, top, side = left * f, top * f, side * f
-        k = ROI_PX / side
-        off = (VIEW - ROI_PX) // 2
-        m = np.array([[k, 0, off - left * k], [0, k, off - top * k]], dtype=np.float32)
-        view = cv2.warpAffine(img_bgr, m, (VIEW, VIEW), flags=cv2.INTER_LINEAR)
-        emb = self._graph.embed_rois(view, [(off, off, off + ROI_PX, off + ROI_PX)])[0]
+        """Embedding of one face. The face is centred in a view at its own resolution (a very
+        large face is shrunk first), and the graph aligns and embeds it with its landmarks,
+        exactly as the live graph does on a video frame."""
+        k = min(1.0, MAX_ALIGN_PX / face_extent(det.kps))
+        img = _resize(img_bgr, k) if k < 1.0 else img_bgr
+        kps = det.kps * k
+        dx, dy = VIEW / 2 - kps[:, 0].mean(), VIEW / 2 - kps[:, 1].mean()
+        shift = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+        view = cv2.warpAffine(img, shift, (VIEW, VIEW), flags=cv2.INTER_NEAREST, borderValue=0)
+        box = tuple(float(v * k + o) for v, o in zip(det.box, (dx, dy, dx, dy)))
+        emb = self._graph.embed(view, [Face(box=box, kps=kps + (dx, dy), score=det.score)])[0]
         if emb is None:
             raise RuntimeError("The recogniser returned no embedding")
         return emb
@@ -141,18 +142,19 @@ class FaceEngine:
         return self.embed_batch([aligned])[0]
 
     def embed_batch(self, aligned_list: list[np.ndarray]) -> np.ndarray:
-        """(N, 512) embeddings of 112x112 faces. They are laid out as a mosaic, 25 to a view,
-        and ArcFace runs on every tile in one pass."""
+        """(N, 512) embeddings of already aligned 112x112 faces (used by the explanation maps).
+        They are laid out as a mosaic, 25 to a view; each tile's landmarks are the template, so
+        the alignment step copies it unchanged and ArcFace embeds every tile in one pass."""
         per_view = MOSAIC * MOSAIC
         out: list[np.ndarray] = []
         for start in range(0, len(aligned_list), per_view):
             chunk = aligned_list[start : start + per_view]
-            view, rects = _canvas(), []
+            view, faces = _canvas(), []
             for i, a in enumerate(chunk):
                 y, x = (i // MOSAIC) * 112, (i % MOSAIC) * 112
                 view[y : y + 112, x : x + 112] = a
-                rects.append((x, y, x + 112, y + 112))
-            embs = self._graph.embed_rois(view, rects)
+                faces.append(Face(box=(x, y, x + 112, y + 112), kps=TEMPLATE + (x, y), score=1.0))
+            embs = self._graph.embed(view, faces)
             if any(e is None for e in embs):
                 raise RuntimeError("The recogniser returned no embedding")
             out.extend(embs)

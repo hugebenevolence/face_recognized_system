@@ -1,12 +1,14 @@
 """Pad probes that turn the DeepStream graph into a face recogniser.
 
-                   nvinfer (SCRFD)        nvtracker        nvinfer (ArcFace)       nvdsosd
-   frames ... --> [probe: detect] ---> [probe: roi] ---> [probe: identify] ---> draws the boxes
+     nvinfer (SCRFD)        nvtracker          nvdspreprocess          nvinfer (ArcFace)      nvdsosd
+  ... --> [probe: detect] --> [probe: align] --> (warp, libface_align) --> [probe: identify] --> boxes
 
-  detect    decodes SCRFD's output tensors into faces and adds them as object metadata.
-  roi       points each tracked face's ROI at the region ArcFace expects (from the landmarks),
-            so the secondary nvinfer crops and scales exactly that area on the GPU.
-  identify  reads the 512-d embedding nvinfer produced, matches it in pgvector, decides
+  detect    decodes SCRFD's output tensors into faces (box + five landmarks) and adds them as
+            object metadata.
+  align     computes each tracked face's alignment (the similarity transform from its landmarks
+            onto the ArcFace template) and stores it in the object's metadata. nvdspreprocess
+            warps the face with it on the GPU and hands the tensor to ArcFace.
+  identify  reads the 512-d embedding ArcFace produced, matches it in pgvector, decides
             known / unknown, labels the box and reports events.
 """
 
@@ -21,9 +23,9 @@ import numpy as np
 import pyds
 
 from .config import Config
-from .dsmeta import SKIP_CLASS, add_object, iter_list as _iter, read_embedding, read_tensors, set_rect
+from .dsmeta import add_object, iter_list as _iter, read_embedding, read_tensors, set_alignment
 from .events import EventPublisher
-from .geometry import aligned_crop, iou as _iou, roi_of
+from .geometry import aligned_crop, alignment_matrix, iou as _iou
 from .matcher import Matcher
 from .quality import assess
 from .scrfd import Face, decode
@@ -63,13 +65,13 @@ class Analytics:
         self.last_raw: Optional[np.ndarray] = None  # newest clean frame (BGR) for /snapshot.jpg
         self._states: dict[tuple[int, int], TrackState] = {}
         self._faces: dict[tuple[int, int], list[Face]] = {}  # detections of the frame in flight
-        self._tight: dict[tuple[int, int], dict[int, tuple[Face, tuple]]] = {}
+        self._aligned: dict[tuple[int, int], dict[int, Face]] = {}  # faces sent to ArcFace, per frame
 
     def reset(self) -> None:
         """New video source: forget tracks (ids restart) and any half-processed frames."""
         self._states.clear()
         self._faces.clear()
-        self._tight.clear()
+        self._aligned.clear()
 
     # ------------------------------------------------------------------ probe 1: detect
     def on_detect(self, pad, info, _user=None):
@@ -83,22 +85,18 @@ class Analytics:
             # without it, and ours is network-type=100 (raw tensors decoded here).
             fm.bInferDone = True
             for f in faces:
-                add_object(bm, fm, f.box, f.score)
+                add_object(bm, fm, f.box, f.score, frame_size=(self.cfg.frame_width, self.cfg.frame_height))
         return Gst_PAD_PROBE_OK
 
-    @staticmethod
-    def _set_rect(om, box) -> None:
-        set_rect(om, box[0], box[1], box[2] - box[0], box[3] - box[1])
-
-    # ------------------------------------------------------------------ probe 2: roi
-    def on_roi(self, pad, info, _user=None):
+    # ------------------------------------------------------------------ probe 2: align
+    def on_align(self, pad, info, _user=None):
         buf = info.get_buffer()
         bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
         for fm in _iter(bm.frame_meta_list, pyds.NvDsFrameMeta.cast):
             key = (fm.source_id, fm.frame_num)
             faces = self._faces.pop(key, [])
-            W, H = self.cfg.frame_width, self.cfg.frame_height
-            tight: dict[int, tuple[Face, tuple]] = {}
+            aligned: dict[int, Face] = {}
+            stale = []
             for om in _iter(fm.obj_meta_list, pyds.NvDsObjectMeta.cast):
                 r = om.rect_params
                 box = (r.left, r.top, r.left + r.width, r.top + r.height)
@@ -108,20 +106,13 @@ class Analytics:
                     if v > best_iou:
                         best, best_iou = f, v
                 if best is None:
-                    om.class_id = SKIP_CLASS  # tracker-predicted box without a fresh detection
+                    stale.append(om)  # tracker prediction without a fresh detection: no landmarks
                     continue
-                left, top, side = roi_of(best.kps)
-                if left < 0 or top < 0 or left + side > W or top + side > H:
-                    om.class_id = SKIP_CLASS  # ROI would leave the frame: not a clean crop
-                    tight[om.object_id] = (best, box)
-                    continue
-                tight[om.object_id] = (best, box)
-                st = self._states.get((fm.source_id, om.object_id))
-                if st is not None and self.frame_idx - st.last_attempt < self._interval(st):
-                    om.class_id = SKIP_CLASS  # identity is still fresh: skip ArcFace for this face
-                    continue
-                r.left, r.top, r.width, r.height = left, top, side, side
-            self._tight[key] = tight
+                set_alignment(om, alignment_matrix(best.kps))
+                aligned[om.object_id] = best
+            for om in stale:
+                pyds.nvds_remove_obj_meta_from_frame(fm, om)
+            self._aligned[key] = aligned
         return Gst_PAD_PROBE_OK
 
     # ------------------------------------------------------------------ probe 3: identify
@@ -136,7 +127,7 @@ class Analytics:
     def _process_frame(self, buf, bm, fm) -> None:
         cfg = self.cfg
         key = (fm.source_id, fm.frame_num)
-        tight = self._tight.pop(key, {})
+        aligned = self._aligned.pop(key, {})
         objs = list(_iter(fm.obj_meta_list, pyds.NvDsObjectMeta.cast))
         frame = None  # RGBA view of the clean frame, mapped lazily
         # a clean copy for /snapshot.jpg every few frames
@@ -146,13 +137,10 @@ class Analytics:
 
         seen = set()
         for om in objs:
-            entry = tight.get(om.object_id)
-            if entry is None:
+            face = aligned.get(om.object_id)
+            if face is None:
                 pyds.nvds_remove_obj_meta_from_frame(fm, om)
                 continue
-            face, box = entry
-            self._set_rect(om, box)  # back from the ArcFace ROI to the face box
-            om.class_id = 0
             sid = (fm.source_id, om.object_id)
             seen.add(sid)
             st = self._states.get(sid)
@@ -162,8 +150,8 @@ class Analytics:
             st.last_seen = self.frame_idx
             st.face = face
 
-            emb = read_embedding(om)  # present only when on_roi let this face through to ArcFace
-            if emb is not None:
+            emb = read_embedding(om)  # absent on frames nvdspreprocess skips (its interval)
+            if emb is not None and self.frame_idx - st.last_attempt >= self._interval(st):
                 self._identify(st, emb)
             if st.status in ("known", "unknown") and st.hits >= cfg.min_hits:
                 if frame is None:
@@ -193,14 +181,14 @@ class Analytics:
 
     # ------------------------------------------------------------------ decisions
     def _interval(self, st: TrackState) -> int:
-        """Frames between ArcFace runs: often while the identity is open, rarely once known."""
+        """Frames between database lookups: often while the identity is open, rarely once known."""
         return self.cfg.reid_interval if st.status == "known" else self.cfg.id_interval
 
     def _identify(self, st: TrackState, emb: np.ndarray) -> None:
         cfg = self.cfg
         st.last_attempt = self.frame_idx
         st.attempts += 1
-        tops = self.matcher.top_matches(emb, cfg.model_pack, k=3)
+        tops = self.matcher.top_matches(emb, cfg.model_id, k=3)
         st.evidence_top = [
             {"person_id": m.person_id, "name": m.name, "code": m.code, "score": round(m.score, 4)} for m in tops
         ]
@@ -225,7 +213,7 @@ class Analytics:
         top = st.evidence_top
         evidence = {
             "version": 1,
-            "model": self.cfg.model_pack,
+            "model": self.cfg.model_id,
             "threshold": self.cfg.match_threshold,
             "det_score": float(face.score),
             "crop_size": [int(crop.shape[1]), int(crop.shape[0])],

@@ -1,14 +1,15 @@
 """A second, small DeepStream graph for still images, running next to the live one.
 
-    appsrc (one 640x640 view) -> nvvideoconvert -> nvstreammux -> nvinfer SCRFD -> nvinfer ArcFace -> fakesink
+    appsrc (640x640 view) -> nvvideoconvert (RGBA) -> nvstreammux -> nvinfer SCRFD
+        -> [probe: faces + alignment] -> nvdspreprocess (face alignment) -> nvinfer ArcFace -> fakesink
 
-Registration photos, group photos, camera captures and explanations go through the same two
-models and the same nvinfer elements as the live video, so a face registered from a photo and the
-same face seen on camera are embedded by identical code. Two kinds of request:
+It is the live chain without the tracker: the same SCRFD and ArcFace engines, the same alignment
+library, the same configs. A face registered from a photo is therefore detected, aligned and
+embedded exactly like the same face seen on camera. Two kinds of request:
 
-  detect      SCRFD finds faces in the view; ArcFace is skipped.
-  embed_rois  SCRFD output is ignored; ArcFace embeds the given rectangles of the view.
-              Used for one face (a crop around it) and for batches (a mosaic of 112x112 faces).
+  detect  SCRFD finds the faces in the view (each one is also aligned and embedded).
+  embed   the faces are given (box + five landmarks from an earlier detect, in view pixels) and
+          only alignment and ArcFace run on them.
 """
 
 import logging
@@ -24,7 +25,8 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 from .config import Config  # noqa: E402
-from .dsmeta import SKIP_CLASS, add_object, iter_list, read_embedding, read_tensors  # noqa: E402
+from .dsmeta import add_object, iter_list, read_embedding, read_tensors, set_alignment  # noqa: E402
+from .geometry import alignment_matrix  # noqa: E402
 from .runner import _caps, _make  # noqa: E402
 from .scrfd import Face, decode  # noqa: E402
 
@@ -39,9 +41,15 @@ class GraphNotReady(RuntimeError):
 
 
 @dataclass
+class StillFace:
+    face: Face
+    embedding: Optional[np.ndarray]
+
+
+@dataclass
 class _Request:
-    mode: str  # "detect" | "rois"
-    rects: tuple = ()
+    mode: str  # "detect" | "embed"
+    faces: tuple = ()  # embed: Face objects in view pixels
     min_px: int = 0
 
 
@@ -57,7 +65,7 @@ class StillGraph:
         self._src: Optional[Gst.Element] = None
         self._req = _Request("detect")
         self._faces: list[Face] = []
-        self._embs: list[Optional[np.ndarray]] = []
+        self._embs: dict[int, np.ndarray] = {}
         self._error: Optional[str] = None
         self._stop = threading.Event()
 
@@ -103,63 +111,66 @@ class StillGraph:
         pipe = Gst.Pipeline.new("still-graph")
         src = _make(
             "appsrc", "still_src", is_live=True, format=Gst.Format.TIME, do_timestamp=True, block=False,
-            max_bytes=4_000_000, caps=Gst.Caps.from_string(f"video/x-raw,format=BGR,width={VIEW},height={VIEW},framerate=30/1"),
+            max_bytes=4_000_000,
+            caps=Gst.Caps.from_string(f"video/x-raw,format=BGR,width={VIEW},height={VIEW},framerate=30/1"),
         )
         conv = _make("nvvideoconvert", "still_conv")
-        rgba = _caps("video/x-raw(memory:NVMM),format=RGBA")  # no chroma subsampling for stills
+        rgba = _caps("video/x-raw(memory:NVMM),format=RGBA")  # the alignment kernel reads RGBA
         mux = _make("nvstreammux", "still_mux", batch_size=1, width=VIEW, height=VIEW,
                     batched_push_timeout=40000, live_source=True)
         pgie = _make("nvinfer", "still_pgie", config_file_path=str(cfg.config_dir / "pgie_scrfd.txt"), unique_id=1)
-        sgie = _make("nvinfer", "still_sgie", config_file_path=str(cfg.config_dir / "sgie_arcface.txt"), unique_id=2)
+        align = _make("nvdspreprocess", "still_align", config_file=str(cfg.config_dir / "preprocess_arcface.txt"))
+        sgie = _make("nvinfer", "still_sgie", config_file_path=str(cfg.config_dir / "sgie_arcface.txt"),
+                     unique_id=2, input_tensor_meta=True)
         sink = _make("fakesink", "still_sink", sync=False)
-        for el in (src, conv, rgba, mux, pgie, sgie, sink):
+        for el in (src, conv, rgba, mux, pgie, align, sgie, sink):
             pipe.add(el)
         src.link(conv)
         conv.link(rgba)
         rgba.get_static_pad("src").link(mux.request_pad_simple("sink_0"))
         mux.link(pgie)
-        pgie.link(sgie)
+        pgie.link(align)
+        align.link(sgie)
         sgie.link(sink)
-        pgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._on_detect, None)
+        pgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._on_faces, None)
         sgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._on_result, None)
         if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("still-image graph refused to start")
         self._pipe, self._src = pipe, src
 
     # ------------------------------------------------------------------ probes
-    def _on_detect(self, pad, info, _user=None):
+    def _on_faces(self, pad, info, _user=None):
+        """After SCRFD: the faces of this request become objects with their alignment."""
         try:
             buf = info.get_buffer()
             bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
             for fm in iter_list(bm.frame_meta_list, pyds.NvDsFrameMeta.cast):
                 req = self._req
-                fm.bInferDone = True
                 if req.mode == "detect":
                     faces = decode(read_tensors(fm), VIEW, VIEW, self.cfg.det_thresh)
-                    self._faces = [f for f in faces if f.size >= req.min_px]
-                    for i, f in enumerate(self._faces):
-                        om = add_object(bm, fm, f.box, f.score, label=str(i))
-                        om.class_id = SKIP_CLASS  # ArcFace is not wanted here
+                    faces = [f for f in faces if f.size >= req.min_px]
                 else:
-                    for i, box in enumerate(req.rects):
-                        add_object(bm, fm, box, 1.0, label=str(i))
+                    faces = list(req.faces)
+                self._faces = faces
+                for i, f in enumerate(faces):
+                    om = add_object(bm, fm, f.box, f.score, label=str(i), frame_size=(VIEW, VIEW))
+                    set_alignment(om, alignment_matrix(f.kps))
         except Exception as exc:  # a probe must never raise into GStreamer
-            log.exception("detect probe failed")
+            log.exception("face probe failed")
             self._error = str(exc)
         return PROBE_OK
 
     def _on_result(self, pad, info, _user=None):
         try:
-            if self._req.mode == "rois":
-                buf = info.get_buffer()
-                bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
-                embs: list[Optional[np.ndarray]] = [None] * len(self._req.rects)
-                for fm in iter_list(bm.frame_meta_list, pyds.NvDsFrameMeta.cast):
-                    for om in iter_list(fm.obj_meta_list, pyds.NvDsObjectMeta.cast):
-                        i = int(om.obj_label)
-                        if 0 <= i < len(embs):
-                            embs[i] = read_embedding(om)
-                self._embs = embs
+            buf = info.get_buffer()
+            bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+            embs: dict[int, np.ndarray] = {}
+            for fm in iter_list(bm.frame_meta_list, pyds.NvDsFrameMeta.cast):
+                for om in iter_list(fm.obj_meta_list, pyds.NvDsObjectMeta.cast):
+                    emb = read_embedding(om)
+                    if emb is not None:
+                        embs[int(om.obj_label)] = emb
+            self._embs = embs
         except Exception as exc:
             log.exception("result probe failed")
             self._error = str(exc)
@@ -167,13 +178,13 @@ class StillGraph:
         return PROBE_OK
 
     # ------------------------------------------------------------------ requests
-    def _run(self, view: np.ndarray, req: _Request) -> None:
+    def _run(self, view: np.ndarray, req: _Request) -> list[StillFace]:
         if view.shape != (VIEW, VIEW, 3) or view.dtype != np.uint8:
             raise ValueError("a view must be a 640x640 BGR image")
         if not self.ready:
             raise GraphNotReady("The still-image graph is still starting (the first start builds TensorRT engines)")
         self._req, self._error = req, None
-        self._faces, self._embs = [], []
+        self._faces, self._embs = [], {}
         self._done.clear()
         self._src.emit("push-buffer", Gst.Buffer.new_wrapped(np.ascontiguousarray(view).tobytes()))
         if not self._done.wait(20):
@@ -181,15 +192,14 @@ class StillGraph:
             raise GraphNotReady("The still-image graph did not answer")
         if self._error:
             raise RuntimeError(self._error)
+        return [StillFace(f, self._embs.get(i)) for i, f in enumerate(self._faces)]
 
-    def detect(self, view: np.ndarray, min_px: int = 12) -> list[Face]:
-        """Faces in a 640x640 view, in view pixels."""
+    def detect(self, view: np.ndarray, min_px: int = 12) -> list[StillFace]:
+        """Faces in a 640x640 view (view pixels), each aligned and embedded."""
         with self._lock:
-            self._run(view, _Request("detect", min_px=min_px))
-            return list(self._faces)
+            return self._run(view, _Request("detect", min_px=min_px))
 
-    def embed_rois(self, view: np.ndarray, rects: list[tuple[float, float, float, float]]) -> list[Optional[np.ndarray]]:
-        """ArcFace embeddings (L2-normalised) of rectangles x1,y1,x2,y2 of a view."""
+    def embed(self, view: np.ndarray, faces: list[Face]) -> list[Optional[np.ndarray]]:
+        """Embeddings of given faces of a view (box + landmarks in view pixels)."""
         with self._lock:
-            self._run(view, _Request("rois", rects=tuple(rects)))
-            return list(self._embs)
+            return [s.embedding for s in self._run(view, _Request("embed", faces=tuple(faces)))]

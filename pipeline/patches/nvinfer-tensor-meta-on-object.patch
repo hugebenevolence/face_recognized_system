@@ -1,0 +1,31 @@
+# Fix for DeepStream 7.1 gst-nvinfer (sources/gst-plugins/gst-nvinfer/gstnvinfer_meta_utils.cpp).
+# With input-tensor-meta=1 (tensors from nvdspreprocess) and output-tensor-meta=1 on objects,
+# upstream adds one user meta to both the frame and the object, so it is released twice and the
+# heap is corrupted. This attaches the output tensor to the object only, like a normal SGIE.
+--- a/gstnvinfer_meta_utils.cpp
++++ b/gstnvinfer_meta_utils.cpp
+@@ -539,7 +539,12 @@
+     user_meta->base_meta.copy_func = copy_tensor_output_meta;
+     user_meta->base_meta.batch_meta = batch_meta;
+ 
+-    if (nvinfer->input_tensor_from_meta) {
++    if (nvinfer->input_tensor_from_meta && frame.obj_meta) {
++      /* Secondary inference on objects with the tensor from nvdspreprocess: attach the tensor
++       * meta to the object, as a regular secondary nvinfer does. (Upstream attaches one ROI
++       * user meta to both the frame and the object, so it is released twice.) */
++      nvds_add_user_meta_to_obj (frame.obj_meta, user_meta);
++    } else if (nvinfer->input_tensor_from_meta) {
+       /* Attach tensor meta as part of ROI Meta */
+       nvds_add_user_meta_to_roi (frame.roi_meta, user_meta);
+       /* Attach ROI Meta to Frame Meta */
+@@ -551,10 +556,6 @@
+       user_meta->base_meta.copy_func = NULL;
+       user_meta->base_meta.batch_meta = batch_meta;
+       nvds_add_user_meta_to_frame (frame.frame_meta, user_meta);
+-      /* if object is roi itself */
+-      if (frame.obj_meta) {
+-        nvds_add_user_meta_to_obj (frame.obj_meta, user_meta);
+-      }
+     } else if (nvinfer->process_full_frame) {
+       nvds_add_user_meta_to_frame (frame.frame_meta, user_meta);
+     } else {

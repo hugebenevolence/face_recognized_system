@@ -1,7 +1,8 @@
-# Secondary GIE: ArcFace (w600k_r50) embedding, one 512-d vector per tracked face.
-# The probe sets each face's ROI from its landmarks first, so nvinfer crops and scales
-# exactly the region ArcFace expects. The probe also marks faces whose identity is still
-# fresh so that this element skips them (class id 1).
+# Secondary GIE: ArcFace (w600k_r50) embedding, one 512-d vector per face.
+# Its input does not come from nvinfer's own crop: the nvdspreprocess element in front of it
+# (preprocess_arcface.txt) aligns every face with its landmarks and attaches the tensor, and this
+# element runs with input-tensor-meta=1 (set in runner.py / still_graph.py). The normalisation
+# below therefore only matters for building the engine.
 [property]
 gpu-id=0
 net-scale-factor=0.0078125
@@ -18,6 +19,3 @@ operate-on-class-ids=0
 network-type=100
 output-tensor-meta=1
 classifier-async-mode=0
-input-object-min-width=32
-input-object-min-height=32
-maintain-aspect-ratio=0

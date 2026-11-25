@@ -70,7 +70,7 @@ def status():
         "connected": runner.connected,
         "fps": runner.fps,
         "error": runner.last_error,
-        "model": cfg.model_pack,
+        "model": cfg.model_id,
         "engine": "DeepStream / TensorRT",
         "match_threshold": cfg.match_threshold,
         "explain_overlay": runner.explain_overlay,
@@ -193,7 +193,7 @@ def _parse_box(box: Optional[str]) -> Optional[tuple]:
 def _similar(emb: np.ndarray) -> list[dict]:
     return [
         {"person_id": m.person_id, "name": m.name, "code": m.code, "score": round(m.score, 4)}
-        for m in runner.analytics.matcher.top_matches(emb, cfg.model_pack, k=3)
+        for m in runner.analytics.matcher.top_matches(emb, cfg.model_id, k=3)
     ]
 
 

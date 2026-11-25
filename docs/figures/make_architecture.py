@@ -208,7 +208,7 @@ rbox(XS[4], YS, BW, BH, C["blue_fill"])
 trapezoid(XS[4] - 0.22, YS, 0.85, 1.05, 0.55, "#9CC2E8")
 text(XS[4] - 0.24, YS, "F", size=24, color=C["blue"], weight="bold", style="italic")
 embedding_bar(XS[4] + 0.52, YS, 0.2, 1.0)
-stage_label(XS[4], Y_LABEL, "Embed", "ArcFace on TensorRT", C["blue"])
+stage_label(XS[4], Y_LABEL, "Align + Embed", "warp, ArcFace TensorRT", C["blue"])
 logo("nvidia", XS[4] - BW / 2 + 0.24, YS - BH / 2 + 0.24, 0.32, z=7)
 
 # 6 match

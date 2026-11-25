@@ -1,11 +1,12 @@
 """Builds and supervises the DeepStream graph.
 
-    source -> nvstreammux -> nvinfer SCRFD -> nvtracker -> nvinfer ArcFace -> nvvideoconvert
-           -> nvdsosd -> tee -+-> nvjpegenc -> appsink      (MJPEG for the browser)
-                              +-> nvv4l2h264enc -> rtspclientsink   (optional RTSP out)
+    source -> nvstreammux -> nvinfer SCRFD -> nvtracker -> nvvideoconvert (RGBA)
+           -> nvdspreprocess (face alignment) -> nvinfer ArcFace -> nvdsosd
+           -> tee -+-> nvjpegenc -> appsink                (MJPEG for the browser)
+                   +-> nvv4l2h264enc -> rtspclientsink     (optional RTSP out)
 
-Detection, tracking, embedding, drawing and encoding all run inside the graph on the GPU.
-Python only wires the elements and handles the metadata in three pad probes (analytics.py).
+Detection, tracking, face alignment, embedding, drawing and encoding all run inside the graph on
+the GPU. Python wires the elements and handles the metadata in three pad probes (analytics.py).
 """
 
 import logging
@@ -181,9 +182,11 @@ class Runner(threading.Thread):
         pgie = _make("nvinfer", "pgie", config_file_path=str(cfg.config_dir / "pgie_scrfd.txt"), unique_id=1)
         tracker = _make("nvtracker", "tracker", ll_lib_file=f"{DS_LIB}/libnvds_nvmultiobjecttracker.so",
                         ll_config_file=str(cfg.config_dir / "tracker_iou.yml"), tracker_width=640, tracker_height=384)
-        sgie = _make("nvinfer", "sgie", config_file_path=str(cfg.config_dir / "sgie_arcface.txt"), unique_id=2)
         conv = _make("nvvideoconvert", "conv")
-        rgba = _caps("video/x-raw(memory:NVMM),format=RGBA")
+        rgba = _caps("video/x-raw(memory:NVMM),format=RGBA")  # the alignment kernel reads RGBA
+        align = _make("nvdspreprocess", "align", config_file=str(cfg.config_dir / "preprocess_arcface.txt"))
+        sgie = _make("nvinfer", "sgie", config_file_path=str(cfg.config_dir / "sgie_arcface.txt"), unique_id=2,
+                     input_tensor_meta=True)
         osd = _make("nvdsosd", "osd", display_text=True)
         tee = _make("tee", "tee")
 
@@ -195,7 +198,7 @@ class Runner(threading.Thread):
         sink = _make("appsink", "sink", emit_signals=True, max_buffers=1, drop=True, sync=False)
         sink.connect("new-sample", self._on_sample)
 
-        chain = [mux, _make("queue", "q_mux"), pgie, tracker, sgie, conv, rgba, osd, tee]
+        chain = [mux, _make("queue", "q_mux"), pgie, tracker, conv, rgba, align, sgie, osd, tee]
         for el in chain + [q1, c1, f1, jpg, sink]:
             pipe.add(el)
         for a, b in zip(chain, chain[1:]):
@@ -209,8 +212,8 @@ class Runner(threading.Thread):
         self._add_source(pipe, spec, mux)
 
         pgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_detect, None)
-        tracker.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_roi, None)
-        rgba.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_identify, None)
+        tracker.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_align, None)
+        sgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_identify, None)
         return pipe
 
     def _add_rtsp_out(self, pipe: Gst.Pipeline, tee: Gst.Element, url: str) -> None:

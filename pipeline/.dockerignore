@@ -1,2 +1,4 @@
 __pycache__
 *.pyc
+face_align/*.o
+face_align/*.so

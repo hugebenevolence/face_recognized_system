@@ -42,7 +42,11 @@ class Config:
     jpeg_quality: int = int(_env("JPEG_QUALITY", "80"))
 
     # --- models ---
-    model_pack: str = _env("MODEL_PACK", "buffalo_l")
+    model_pack: str = _env("MODEL_PACK", "buffalo_l")  # which insightface models are loaded
+    # Names the embedding space: the model pack plus how faces are prepared for it. Stored vectors
+    # are only compared with vectors of the same id, and the backend re-embeds stored photos when
+    # it changes (POST /api/admin/reanalyze). "aligned" = full landmark alignment in nvdspreprocess.
+    model_id: str = _env("MODEL_ID", _env("MODEL_PACK", "buffalo_l") + "-aligned")
     det_thresh: float = float(_env("DET_THRESH", "0.5"))
     min_face_px: int = int(_env("MIN_FACE_PX", "40"))
 
