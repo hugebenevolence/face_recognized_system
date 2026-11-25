@@ -143,8 +143,8 @@ class FaceEngine:
 
     def embed_batch(self, aligned_list: list[np.ndarray]) -> np.ndarray:
         """(N, 512) embeddings of already aligned 112x112 faces (used by the explanation maps).
-        They are laid out as a mosaic, 25 to a view; each tile's landmarks are the template, so
-        the alignment step copies it unchanged and ArcFace embeds every tile in one pass."""
+        They are laid out as a mosaic, 25 to a view, as objects of the "aligned face" class, so
+        the alignment step only copies each tile and ArcFace embeds every tile in one pass."""
         per_view = MOSAIC * MOSAIC
         out: list[np.ndarray] = []
         for start in range(0, len(aligned_list), per_view):
@@ -154,7 +154,7 @@ class FaceEngine:
                 y, x = (i // MOSAIC) * 112, (i % MOSAIC) * 112
                 view[y : y + 112, x : x + 112] = a
                 faces.append(Face(box=(x, y, x + 112, y + 112), kps=TEMPLATE + (x, y), score=1.0))
-            embs = self._graph.embed(view, faces)
+            embs = self._graph.embed(view, faces, prealigned=True)
             if any(e is None for e in embs):
                 raise RuntimeError("The recogniser returned no embedding")
             out.extend(embs)

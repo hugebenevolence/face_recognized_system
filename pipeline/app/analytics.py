@@ -1,13 +1,13 @@
 """Pad probes that turn the DeepStream graph into a face recogniser.
 
-     nvinfer (SCRFD)        nvtracker          nvdspreprocess          nvinfer (ArcFace)      nvdsosd
-  ... --> [probe: detect] --> [probe: align] --> (warp, libface_align) --> [probe: identify] --> boxes
+     nvinfer (SCRFD)        nvtracker            nvdspreprocess              nvinfer (ArcFace)      nvdsosd
+  ... --> [probe: detect] --> [probe: tracked] --> (face alignment, C++/CUDA) --> [probe: identify] --> boxes
 
   detect    decodes SCRFD's output tensors into faces (box + five landmarks) and adds them as
             object metadata.
-  align     computes each tracked face's alignment (the similarity transform from its landmarks
-            onto the ArcFace template) and stores it in the object's metadata. nvdspreprocess
-            warps the face with it on the GPU and hands the tensor to ArcFace.
+  tracked   pairs each tracked face with its fresh detection and drops tracker-only predictions,
+            which have no landmarks. The alignment itself is done by nvdspreprocess
+            (pipeline/face_align), which reads SCRFD's landmarks from the same frame's metadata.
   identify  reads the 512-d embedding ArcFace produced, matches it in pgvector, decides
             known / unknown, labels the box and reports events.
 """
@@ -23,9 +23,9 @@ import numpy as np
 import pyds
 
 from .config import Config
-from .dsmeta import add_object, iter_list as _iter, read_embedding, read_tensors, set_alignment
+from .dsmeta import add_object, iter_list as _iter, read_embedding, read_tensors
 from .events import EventPublisher
-from .geometry import aligned_crop, alignment_matrix, iou as _iou
+from .geometry import aligned_crop, iou as _iou
 from .matcher import Matcher
 from .quality import assess
 from .scrfd import Face, decode
@@ -88,8 +88,8 @@ class Analytics:
                 add_object(bm, fm, f.box, f.score, frame_size=(self.cfg.frame_width, self.cfg.frame_height))
         return Gst_PAD_PROBE_OK
 
-    # ------------------------------------------------------------------ probe 2: align
-    def on_align(self, pad, info, _user=None):
+    # ------------------------------------------------------------------ probe 2: tracked
+    def on_tracked(self, pad, info, _user=None):
         buf = info.get_buffer()
         bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
         for fm in _iter(bm.frame_meta_list, pyds.NvDsFrameMeta.cast):
@@ -108,7 +108,6 @@ class Analytics:
                 if best is None:
                     stale.append(om)  # tracker prediction without a fresh detection: no landmarks
                     continue
-                set_alignment(om, alignment_matrix(best.kps))
                 aligned[om.object_id] = best
             for om in stale:
                 pyds.nvds_remove_obj_meta_from_frame(fm, om)

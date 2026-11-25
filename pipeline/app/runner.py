@@ -212,7 +212,7 @@ class Runner(threading.Thread):
         self._add_source(pipe, spec, mux)
 
         pgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_detect, None)
-        tracker.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_align, None)
+        tracker.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_tracked, None)
         sgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, an.on_identify, None)
         return pipe
 

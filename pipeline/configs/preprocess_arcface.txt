@@ -1,8 +1,8 @@
-# nvdspreprocess in front of the ArcFace nvinfer: face alignment.
-# For every face object it warps the face out of the RGBA frame with the 2x3 similarity transform
-# the pipeline computed from SCRFD's five landmarks (rotation, scale, translation onto the ArcFace
-# template), and writes the normalised 3x112x112 tensor that ArcFace reads. The warp runs as a CUDA
-# kernel in libface_align.so (pipeline/face_align), on the GPU frame.
+# nvdspreprocess in front of the ArcFace nvinfer: face alignment (libface_align.so, pipeline/face_align).
+# For every face object it reads SCRFD's five landmarks from the frame's tensor metadata (the
+# detector runs with output-tensor-meta=1), fits the similarity transform (rotation, scale,
+# translation) onto the ArcFace template, warps the face out of the RGBA frame on the GPU with a
+# CUDA kernel and writes the normalised 3x112x112 tensor that ArcFace reads.
 [property]
 enable=1
 # the ArcFace nvinfer (gie-unique-id=2) consumes these tensors
@@ -35,11 +35,18 @@ custom-tensor-preparation-function=CustomTensorPreparation
 # ArcFace normalisation: (pixel - 127.5) / 128
 pixel-normalization-factor=0.0078125
 offsets=127.5;127.5;127.5
+# where the landmarks come from: the SCRFD nvinfer (gie-unique-id=1), same threshold as the probe
+detector-unique-id=1
+detector-threshold=0.5
+detector-input-size=640
+# objects of this class are already aligned 112x112 faces (explanation maps): scaled, not re-aligned
+aligned-class-id=1
 
 [group-0]
 src-ids=-1
 process-on-all-objects=1
-operate-on-class-ids=0
+# 0 = face found by SCRFD, 1 = already aligned face (still-image graph only)
+operate-on-class-ids=0;1
 custom-input-transformation-function=CustomAsyncTransformation
 input-object-min-width=24
 input-object-min-height=24

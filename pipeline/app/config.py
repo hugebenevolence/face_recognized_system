@@ -46,6 +46,7 @@ class Config:
     # Names the embedding space: the model pack plus how faces are prepared for it. Stored vectors
     # are only compared with vectors of the same id, and the backend re-embeds stored photos when
     # it changes (POST /api/admin/reanalyze). "aligned" = full landmark alignment in nvdspreprocess.
+    # DET_THRESH is also set in configs/preprocess_arcface.txt (detector-threshold); keep them equal.
     model_id: str = _env("MODEL_ID", _env("MODEL_PACK", "buffalo_l") + "-aligned")
     det_thresh: float = float(_env("DET_THRESH", "0.5"))
     min_face_px: int = int(_env("MIN_FACE_PX", "40"))

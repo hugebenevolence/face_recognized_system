@@ -7,26 +7,8 @@ import numpy as np
 import pyds
 
 PGIE_ID, SGIE_ID = 1, 2
+FACE_CLASS, ALIGNED_FACE_CLASS = 0, 1  # object classes: a detected face / an already aligned 112x112 face
 UNTRACKED_OBJECT_ID = 0xFFFFFFFFFFFFFFFF  # pyds does not export this constant
-# Marker in misc_obj_info[3]: fields 0..2 hold the face alignment matrix (see face_align.cpp)
-ALIGN_MAGIC = 0x46414C4E
-
-
-def set_alignment(om, matrix: np.ndarray) -> None:
-    """Stores the 2x3 alignment matrix in the object's user-defined fields, where the alignment
-    library of nvdspreprocess reads it: six float32 packed into three int64, then the marker."""
-    packed = np.frombuffer(np.asarray(matrix, dtype=np.float32).reshape(6).tobytes(), dtype=np.int64)
-    fields = _misc_obj_info(om)
-    fields[0:3] = packed
-    fields[3] = ALIGN_MAGIC
-
-
-def _misc_obj_info(om) -> np.ndarray:
-    """The object's misc_obj_info (gint64[4] in nvdsmeta.h) as a writable int64 array. pyds 1.2
-    exposes it as an int32[4] view, which covers only half of the field, so the full field is
-    addressed through the start of that view."""
-    addr = om.misc_obj_info.ctypes.data
-    return np.ctypeslib.as_array((ctypes.c_int64 * 4).from_address(addr))
 
 
 def iter_list(head, cast):
@@ -80,14 +62,15 @@ def clip_box(box, width: int, height: int) -> tuple[float, float, float, float]:
     return x1, y1, x2, y2
 
 
-def add_object(bm, fm, box, score: float = 1.0, label: str = "face", frame_size: tuple[int, int] = None):
+def add_object(bm, fm, box, score: float = 1.0, label: str = "face", frame_size: tuple[int, int] = None,
+               class_id: int = FACE_CLASS):
     """Adds a detector object (as if PGIE had produced it) to a frame and returns it.
     With frame_size (width, height) the box is clipped to the frame first."""
     if frame_size is not None:
         box = clip_box(box, *frame_size)
     om = pyds.nvds_acquire_obj_meta_from_pool(bm)
     om.unique_component_id = PGIE_ID
-    om.class_id = 0
+    om.class_id = class_id
     om.confidence = score
     om.object_id = UNTRACKED_OBJECT_ID
     om.obj_label = label

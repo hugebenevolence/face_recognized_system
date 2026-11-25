@@ -8,8 +8,10 @@ library, the same configs. A face registered from a photo is therefore detected,
 embedded exactly like the same face seen on camera. Two kinds of request:
 
   detect  SCRFD finds the faces in the view (each one is also aligned and embedded).
-  embed   the faces are given (box + five landmarks from an earlier detect, in view pixels) and
-          only alignment and ArcFace run on them.
+  embed   the faces are given (boxes in view pixels). SCRFD still runs on the view, and the
+          alignment library takes each face's landmarks from it, exactly as in the live graph.
+          With prealigned=True the faces are already aligned 112x112 images (explanation maps):
+          they are added as the "aligned face" class and only scaled, never re-aligned.
 """
 
 import logging
@@ -25,8 +27,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 from .config import Config  # noqa: E402
-from .dsmeta import add_object, iter_list, read_embedding, read_tensors, set_alignment  # noqa: E402
-from .geometry import alignment_matrix  # noqa: E402
+from .dsmeta import ALIGNED_FACE_CLASS, FACE_CLASS, add_object, iter_list, read_embedding, read_tensors  # noqa: E402
 from .runner import _caps, _make  # noqa: E402
 from .scrfd import Face, decode  # noqa: E402
 
@@ -50,6 +51,7 @@ class StillFace:
 class _Request:
     mode: str  # "detect" | "embed"
     faces: tuple = ()  # embed: Face objects in view pixels
+    prealigned: bool = False  # embed: the faces are already aligned 112x112 images
     min_px: int = 0
 
 
@@ -140,7 +142,7 @@ class StillGraph:
 
     # ------------------------------------------------------------------ probes
     def _on_faces(self, pad, info, _user=None):
-        """After SCRFD: the faces of this request become objects with their alignment."""
+        """After SCRFD: the faces of this request become objects."""
         try:
             buf = info.get_buffer()
             bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
@@ -152,9 +154,9 @@ class StillGraph:
                 else:
                     faces = list(req.faces)
                 self._faces = faces
+                cls = ALIGNED_FACE_CLASS if req.prealigned else FACE_CLASS
                 for i, f in enumerate(faces):
-                    om = add_object(bm, fm, f.box, f.score, label=str(i), frame_size=(VIEW, VIEW))
-                    set_alignment(om, alignment_matrix(f.kps))
+                    add_object(bm, fm, f.box, f.score, label=str(i), frame_size=(VIEW, VIEW), class_id=cls)
         except Exception as exc:  # a probe must never raise into GStreamer
             log.exception("face probe failed")
             self._error = str(exc)
@@ -199,7 +201,7 @@ class StillGraph:
         with self._lock:
             return self._run(view, _Request("detect", min_px=min_px))
 
-    def embed(self, view: np.ndarray, faces: list[Face]) -> list[Optional[np.ndarray]]:
-        """Embeddings of given faces of a view (box + landmarks in view pixels)."""
+    def embed(self, view: np.ndarray, faces: list[Face], prealigned: bool = False) -> list[Optional[np.ndarray]]:
+        """Embeddings of given faces of a view (boxes in view pixels)."""
         with self._lock:
-            return [s.embedding for s in self._run(view, _Request("embed", faces=tuple(faces)))]
+            return [s.embedding for s in self._run(view, _Request("embed", faces=tuple(faces), prealigned=prealigned))]

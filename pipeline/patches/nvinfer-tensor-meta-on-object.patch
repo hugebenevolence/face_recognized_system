@@ -1,7 +1,20 @@
-# Fix for DeepStream 7.1 gst-nvinfer (sources/gst-plugins/gst-nvinfer/gstnvinfer_meta_utils.cpp).
-# With input-tensor-meta=1 (tensors from nvdspreprocess) and output-tensor-meta=1 on objects,
-# upstream adds one user meta to both the frame and the object, so it is released twice and the
-# heap is corrupted. This attaches the output tensor to the object only, like a normal SGIE.
+# Fix for DeepStream 7.1 gst-nvinfer, gstnvinfer_meta_utils.cpp, attach_tensor_output_meta().
+#
+# Case: a secondary nvinfer on objects whose input tensor comes from nvdspreprocess
+# (input-tensor-meta=1) with output-tensor-meta=1, as for an embedding model such as ArcFace.
+# For each object nvinfer wraps the preprocess ROI (NvDsRoiMeta, owned by the preprocess batch
+# meta) in one NVDS_ROI_META user meta and adds that same user meta to the frame AND to the
+# object. When the buffer is released it is released twice, and its release function
+# (release_user_meta_at_frame_level) also runs "delete roi_meta->object_meta" on the object,
+# which belongs to the batch meta pool. Result: "double free or corruption" crashes.
+# The classifier path (attach_metadata_classifier) has the same double attachment, which matches
+# the unresolved NVIDIA forum report "Double Free or Corruption Crash with nvdspreprocess and
+# SGIE nvinfer" (DeepStream 6.4 to 7.1).
+#
+# Fix: when the ROI is an object, attach the output tensor meta to the object only, which is
+# where a regular secondary nvinfer puts it (Gst-nvinfer docs: NvDsInferTensorMeta is attached
+# to each object's obj_user_meta_list). Frame-level ROIs keep the original behaviour.
+# Applied in pipeline/Dockerfile to the source NVIDIA ships in the DeepStream image.
 --- a/gstnvinfer_meta_utils.cpp
 +++ b/gstnvinfer_meta_utils.cpp
 @@ -539,7 +539,12 @@
